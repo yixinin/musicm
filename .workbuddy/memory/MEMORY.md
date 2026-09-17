@@ -103,14 +103,26 @@ cd tools/linuxcheck && cargo check --target aarch64-unknown-linux-gnu
 
 ## 凭据与登录（M5a，已实现）
 
-- **扫码登录不需要实现 weapi/eapi 加密**：直连 `https://music.163.com/api/login/qrcode/*`
-  在 crypto='' 的明文路径下就能用。两套端点映射（Direct / Sidecar）见技能 `netease-music-api` 第九节。
+- ⚠️ **扫码登录实际已被网易云风控封死，不要把主路径压在它上面。**
+  扫码后会返回 `code=8821`（「需要行为验证码验证」）。它**出现在扫码成功之后**，
+  所以症状很像「网络慢」——实际上永远不可能成功，重扫/换 `type`/换二维码都无效。
+  详细分析见技能 `netease-music-api` 第九节。
+- **cookie 粘贴才是可靠路径**，已做成一等公民：`login --cookie '<串>'` /
+  `--cookie-file <路径>` / stdin 管道三种输入，值必须含 `MUSIC_U`（只有 `MUSIC_A` 不算登录）。
+- **`8821` 必须是终止态。** 曾经把它和「自建服务返回空对象 `{}`」一起塞进 `QrState::Unknown`，
+  后果是用户扫完码后终端一直「继续等待」，把 5 分钟超时耗光才报错。
+  现在拆成三档：`Empty`（无 code，继续轮询）/ `Blocked`（8821，立刻终止）/ `Unrecognized`
+  （其它码，打印原始 code+message 后继续轮询），并由 `QrState::is_terminal()` 统一裁决。
+  轮询循环里挂了 `debug_assert!` 不变式，防止以后新增终止态时又退化成傻等。
 - cookie **单独存 `<data_dir>/cookie.txt`**，Unix 下 600，绝不回写 `config.json`。
   为此 `Config::cookie` 用的是 `#[serde(default, skip_serializing)]`——
   **不是** `skip_serializing_if = "Option::is_none"`（那个只跳过 `None`，明文照样落盘，踩过）。
 - 凭据来源要能报出来（环境变量 / 文件 / 从 config.json 迁移），见 `auth::Origin`。
   失效时用户才知道该去清哪里。
 - `--cookie` **只属于 `login` 命令**，没有全局同名参数。曾经两处都有，一次调用写两遍。
+- ⚠️ `ureq` 会读 `HTTP_PROXY`/`ALL_PROXY` 环境变量。**带代理跑极易触发风控**
+  （出口是机房 IP），本机联调时也会让 `127.0.0.1` 的假侧车请求变成
+  `CONNECT proxy failed` —— 给测试用的临时服务要么设 `NO_PROXY`，要么把代理清掉。
 
 ## CLI surface
 

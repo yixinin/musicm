@@ -61,7 +61,7 @@ pub struct Account {
     pub vip_type: i32,
 }
 
-/// 扫码状态。网易云用 800~803 表示。
+/// 扫码状态。网易云用 800~803 表示，此外还有若干**终止性**的错误码。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QrState {
     /// 801：还没人扫
@@ -72,8 +72,19 @@ pub enum QrState {
     Confirmed,
     /// 800：二维码过期
     Expired,
-    /// 其它，包括自建服务返回空响应的情况——继续轮询即可
-    Unknown,
+    /// 8821：风控要求「行为验证码验证」。
+    ///
+    /// 这是**终止态**：网易云判定这次登录请求不像官方客户端（或 IP/频率可疑），
+    /// 要人过滑块/点选验证码才放行。第三方客户端拿不到这个验证码，
+    /// 所以继续轮询不会有任何变化——只会白等满超时。
+    /// 首见症状就是「扫了，App 显示已确认，但终端一直说继续等待」。
+    Blocked,
+    /// 响应里根本没有 `code`（自建服务内部出错时会回一个空对象 `{}`）。
+    /// 这是**瞬时**状态，继续轮询是对的。
+    Empty,
+    /// 其它没见过的码。仍然继续轮询，但必须把原始 message 亮给用户，
+    /// 否则接口一变，用户就只能干等到超时。
+    Unrecognized,
 }
 
 impl QrState {
@@ -83,8 +94,18 @@ impl QrState {
             802 => QrState::Scanned,
             803 => QrState::Confirmed,
             800 => QrState::Expired,
-            _ => QrState::Unknown,
+            8821 => QrState::Blocked,
+            0 => QrState::Empty,
+            _ => QrState::Unrecognized,
         }
+    }
+
+    /// 是否该停止轮询。`Empty` 和 `Unrecognized` 都不算——它们还可能好转。
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            QrState::Confirmed | QrState::Expired | QrState::Blocked
+        )
     }
 }
 
@@ -918,5 +939,68 @@ impl RawTrack {
             fee: self.fee,
             playable: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 这四个是「正常流程」的码，必须稳定映射。
+    #[test]
+    fn known_codes_map_to_states() {
+        assert_eq!(QrState::from_code(801), QrState::Waiting);
+        assert_eq!(QrState::from_code(802), QrState::Scanned);
+        assert_eq!(QrState::from_code(803), QrState::Confirmed);
+        assert_eq!(QrState::from_code(800), QrState::Expired);
+    }
+
+    /// 8821 是风控拒绝，必须与「空响应」分开。
+    ///
+    /// 这两者以前共用一个 `Unknown`，后果是：用户扫完码、App 显示已确认，
+    /// 终端却一直打印「继续等待」，直到把超时耗光——把一个立即可知的失败
+    /// 拖成了 5 分钟的傻等。
+    #[test]
+    fn risk_control_is_not_confused_with_empty_response() {
+        let blocked = QrState::from_code(8821);
+        let empty = QrState::from_code(0);
+        assert_eq!(blocked, QrState::Blocked);
+        assert_eq!(empty, QrState::Empty);
+        assert_ne!(blocked, empty, "风控拒绝和空响应是完全相反的两件事");
+    }
+
+    /// 终止态必须是「不能再等了」的那几个。
+    #[test]
+    fn only_final_states_are_terminal() {
+        for terminal in [
+            QrState::Confirmed,
+            QrState::Expired,
+            QrState::Blocked,
+        ] {
+            assert!(terminal.is_terminal(), "{terminal:?} 应当终止轮询");
+        }
+        // 这几个还得接着等
+        for ongoing in [QrState::Waiting, QrState::Scanned, QrState::Empty] {
+            assert!(!ongoing.is_terminal(), "{ongoing:?} 不该终止轮询");
+        }
+    }
+
+    /// 没见过的码不能当成终止态：接口加了新状态时，
+    /// 宁可多等一会儿，也不要误判成失败让用户白重来一次。
+    #[test]
+    fn unrecognized_codes_keep_polling() {
+        let odd = QrState::from_code(-447);
+        assert_eq!(odd, QrState::Unrecognized);
+        assert!(!odd.is_terminal());
+    }
+
+    /// `QrPoll` 必须把 code 原样留住——报错文案里要打给用户看。
+    #[test]
+    fn poll_keeps_raw_code_and_message() {
+        let poll = QrPoll::new(8821, "需要行为验证码验证".to_string(), None);
+        assert_eq!(poll.state, QrState::Blocked);
+        assert_eq!(poll.code, 8821);
+        assert_eq!(poll.message, "需要行为验证码验证");
+        assert!(poll.cookie.is_none(), "没成功就不该有凭据");
     }
 }

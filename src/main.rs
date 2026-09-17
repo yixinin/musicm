@@ -331,9 +331,9 @@ fn login_by_qr(cfg: &Config, timeout_secs: u64) -> Result<()> {
             match poll.state {
                 QrState::Waiting => println!("等待扫码…"),
                 QrState::Scanned => println!("已扫码，请在手机上确认登录"),
-                // 把原始返回打出来：不然接口行为一变，用户就只能干等 5 分钟
-                QrState::Unknown => println!(
-                    "接口返回了预期外的状态（code={}，{}），继续等待…",
+                // 没见过的码要把原始返回亮出来：不然接口一变，用户就只能干等满超时
+                QrState::Unrecognized => println!(
+                    "接口返回了没见过的状态（code={}，{}），继续等待…",
                     poll.code,
                     poll.message.trim()
                 ),
@@ -361,10 +361,41 @@ fn login_by_qr(cfg: &Config, timeout_secs: u64) -> Result<()> {
                 return Ok(());
             }
             QrState::Expired => bail!("二维码已过期，重新执行 `musicm login --qr`"),
-            _ => {}
+            // 终止态：再等下去只是把超时耗光，立刻停下来给替代方案
+            QrState::Blocked => return Err(risk_control_error(poll.code, &poll.message)),
+            // 不变式：上面三个覆盖了所有终止态。以后 `QrState` 新增一个终止态却忘了
+            // 在这里处理，就会退化成「傻等满超时」——正是 8821 那个 bug 的形状。
+            ongoing => debug_assert!(
+                !ongoing.is_terminal(),
+                "有终止态漏了处理: {ongoing:?}"
+            ),
         }
     }
     bail!("等待 {timeout_secs} 秒仍未确认，二维码已作废。重新执行 `musicm login --qr`")
+}
+
+/// 8821 的说明。
+///
+/// 这是个「换个办法」的错误，不是「再试一次」的错误：网易云判定请求不像官方客户端，
+/// 要求过行为验证码（滑块/点选），而第三方客户端拿不到那个验证码——所以重扫多少次
+/// 都会在**扫码之后**被同样拦下。必须一次性把可用的替代路径讲清楚，
+/// 否则用户只会反复重扫，然后以为是自己账号的问题。
+fn risk_control_error(code: i32, message: &str) -> anyhow::Error {
+    anyhow!(
+        "登录被网易云风控拦下（code={code}，{}）。\n\
+         \n\
+         这不是二维码过期，重扫不会变好。网易云要求过「行为验证码」（滑块/点选），\n\
+         而命令行/第三方客户端拿不到它，所以每次都会在扫码成功那一刻被拒。\n\
+         \n\
+         改走 cookie，这条路不受风控影响：\n\
+         1. 浏览器登录 https://music.163.com，确认是已登录状态；\n\
+         2. F12 → Application → Cookies → https://music.163.com；\n\
+         3. 找到 MUSIC_U（值很长，别复制错），连同 __csrf 一起抄下来；\n\
+         4. musicm login --cookie 'MUSIC_U=...; __csrf=...'\n\
+         \n\
+         凭据有效期通常几十天，过期后再抄一次即可。",
+        message.trim()
+    )
 }
 
 fn print_account(acc: &crate::netease::Account) {
