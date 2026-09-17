@@ -1,0 +1,21 @@
+[package]
+name = "musicm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+lofty = "0.25.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+ureq = "3.4.2"
+
+# FUSE 只在 Linux 上编译，按 target 隔离，这样 Windows 开发机上照常 cargo build / cargo test。
+#
+# 刻意关掉 fuser 的默认特性（`libfuse`）：打开它就要链接 libfuse 这个 C 库，
+# NAS 上得多装一个 libfuse-dev。我们只需要「挂载 / 卸载」两个动作，
+# 这可以交给 fuse3 包自带的 `fusermount3` 可执行文件完成，代价是运行期需要它存在。
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", default-features = false }
+libc = "0.2"

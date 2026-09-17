@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "linuxcheck"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# 唯一的目的是把 Linux 专属代码真正编译一遍，所以依赖只要凑够能编过就行。
+#
+# 刻意不引 ureq / lofty：它们会拖进 ring，而 ring 带 C 代码，
+# 交叉编译就无法只停在 check 阶段（会要求 aarch64 的 C 工具链）。
+#
+# 运行方式（在开发机上，不需要 Linux）：
+#   cd tools/linuxcheck
+#   cargo check --target aarch64-unknown-linux-gnu
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", default-features = false }
+libc = "0.2"

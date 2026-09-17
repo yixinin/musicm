@@ -1,0 +1,9 @@
+/target
+
+# 交叉编译检查用的壳子自己的构建产物（它是个独立 workspace）
+/tools/linuxcheck/target
+/tools/linuxcheck/Cargo.lock
+
+# 刻意忽略：本地输出目录与下载中断留下的临时分片
+/library/
+*.part.*
