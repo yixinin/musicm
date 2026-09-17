@@ -19,7 +19,7 @@
 //! 结论适用于以后：**平台专属的代码要放在这种「总是被编译的叶子模块」里**，
 //! 而不是用 `#[cfg]` 从 `main.rs` 里挖掉一块。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -97,4 +97,131 @@ pub fn mount_now(
         std::env::consts::OS,
         args.mountpoint.display()
     ))
+}
+
+// ---------- 给 Web 管理界面用的挂载控制 ----------
+//
+// 这三个函数同样按平台分叉，但都放在这个「总是被编译的文件」里，
+// 所以 Windows 的 `cargo build` 编非 Linux 那一支、`tools/linuxcheck` 编 Linux 那一支，
+// 合起来每一行都被真正编译过（理由见文件头的模块文档）。
+//
+// 用 `cfg!` 而不是把整个函数 `#[cfg]` 掉的那个例外是 `fuse_supported`：
+// 它要返回一个**运行时**布尔值给界面决定按钮亮不亮，两个平台都得有自己的实现。
+
+/// 当前平台能不能真的挂载 FUSE。
+pub const fn fuse_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// 卸载一个挂载点。
+///
+/// 走外部命令而不是 `libc::umount`：挂载本身也是 `fusermount3` 干的
+/// （见文件头关于 `default-features = false` 的取舍），保持同一套依赖。
+#[cfg(target_os = "linux")]
+pub fn unmount(mountpoint: &Path) -> Result<()> {
+    use anyhow::bail;
+
+    // fusermount3 是 fuse3 包的新名字，老发行版里还叫 fusermount。
+    // 两个都试，但要把「没装」和「装了但卸载失败」分开报——
+    // 前者要去装包，后者要看错误信息，提示完全不同。
+    let mut attempts: Vec<String> = Vec::new();
+    for bin in ["fusermount3", "fusermount"] {
+        let out = match std::process::Command::new(bin)
+            .arg("-u")
+            .arg(mountpoint)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                attempts.push(format!("{bin}（未安装）"));
+                continue;
+            }
+            Err(e) => bail!("执行 {bin} 失败: {e}"),
+        };
+        if out.status.success() {
+            return Ok(());
+        }
+        attempts.push(format!(
+            "{bin}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    bail!(
+        "卸载 {} 失败。\n尝试记录：{}\n\
+         挂载点本来就没挂上（或已被别的进程卸载）也会是这个样子，\
+         可以用 `mount | grep musicm` 确认。",
+        mountpoint.display(),
+        attempts.join("；")
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn unmount(_mountpoint: &Path) -> Result<()> {
+    anyhow::bail!(
+        "FUSE 只在 Linux 上可用，当前是 {}，没有可卸载的挂载点。",
+        std::env::consts::OS
+    )
+}
+
+/// 挂载点上现在是什么文件系统。没挂载时返回 `None`。
+///
+/// 存在的理由：进程重启之后界面上那个「已挂载」的标记就丢了，
+/// 但内核里的挂载其实还在。问一次 `/proc/mounts` 才能说实话。
+#[cfg(target_os = "linux")]
+pub fn mounted_fstype(mountpoint: &Path) -> Option<String> {
+    let text = std::fs::read_to_string("/proc/mounts").ok()?;
+    let want = escape_mount_field(&mountpoint.to_string_lossy());
+    // 每行形如：musicm /vol1/1000/music fuse.musicm ro,nosuid,...
+    // 第 2 列是挂载点，第 3 列是文件系统类型。
+    text.lines().find_map(|line| {
+        let mut it = line.split_whitespace();
+        let _source = it.next()?;
+        if it.next()? != want {
+            return None;
+        }
+        it.next().map(|s| s.to_string())
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn mounted_fstype(_mountpoint: &Path) -> Option<String> {
+    None
+}
+
+/// `/proc/mounts` 把路径里的空格转义成 `\040`，比较前要转过来。
+#[cfg(target_os = "linux")]
+fn escape_mount_field(path: &str) -> String {
+    path.replace('\\', "\\134")
+        .replace(' ', "\\040")
+        .replace('\t', "\\011")
+        .replace('\n', "\\012")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 平台判定要和 `cfg!` 说的一致——界面靠它决定挂载按钮亮不亮。
+    #[test]
+    fn fuse_support_matches_the_platform() {
+        assert_eq!(fuse_supported(), cfg!(target_os = "linux"));
+    }
+
+    /// 非 Linux 上卸载必须明确失败而不是静默成功：
+    /// 静默成功会让界面显示「已卸载」，而实际上什么都没发生。
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn unmount_is_rejected_off_linux() {
+        let err = unmount(Path::new("/tmp/musicm-not-here")).unwrap_err();
+        assert!(err.to_string().contains("Linux"), "实际: {err}");
+    }
+
+    /// 挂载点的空格转义。比错了会导致「明明挂上了却显示未挂载」。
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn mount_fields_are_escaped_like_the_kernel_does() {
+        assert_eq!(escape_mount_field("/vol1/音乐"), "/vol1/音乐");
+        assert_eq!(escape_mount_field("/vol1/my music"), "/vol1/my\\040music");
+    }
 }

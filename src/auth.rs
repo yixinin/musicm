@@ -71,16 +71,19 @@ impl Origin {
 #[derive(Debug, Clone)]
 pub struct Credentials {
     raw: String,
+    /// 粘贴内容里被丢掉的重名 cookie。空表示没有重名。
+    dropped: Vec<String>,
 }
 
 impl Credentials {
-    /// 归一化并检查登录字段。
+    /// 归一化、去重并检查登录字段。
     pub fn parse(raw: &str) -> Result<Credentials> {
         let normalized = normalize(raw);
         if normalized.is_empty() {
             bail!("cookie 是空的");
         }
-        let cred = Credentials { raw: normalized };
+        let (raw, dropped) = dedupe(&normalized);
+        let cred = Credentials { raw, dropped };
         if !cred.has_login() {
             bail!(
                 "这串 cookie 里没有 {LOGIN_KEY}，它不构成登录态。\n\
@@ -93,6 +96,16 @@ impl Credentials {
 
     pub fn as_str(&self) -> &str {
         &self.raw
+    }
+
+    /// 粘贴内容里被丢掉的重名 cookie（同名只保留第一条）。
+    ///
+    /// 浏览器按 `(name, domain, path)` 存 cookie，同一个名字可以存在多份，
+    /// DevTools 的 cookies 表里就是多行——手抄时很容易全带上。
+    /// HTTP 头里带两条同名 cookie 是有歧义的，所以我们先收敛成一条再落盘。
+    /// 调用方拿它来提示用户「哪些被忽略了」，免得用户以为抄漏了。
+    pub fn dropped(&self) -> &[String] {
+        &self.dropped
     }
 
     /// 是否具备登录态。只看 `MUSIC_U` 有没有值，不判断它是否还有效
@@ -136,13 +149,72 @@ impl Credentials {
 /// 按 RFC 6265，cookie 的名字和值都是 token，不含空格和逗号，
 /// 所以「删掉空白」不可能把两个合法字段粘成别的意思。
 pub fn normalize(raw: &str) -> String {
-    let joined: String = raw
-        .split_whitespace()
+    let src = extract_cookie_header(raw).unwrap_or(raw);
+    src.split_whitespace()
         .collect::<Vec<_>>()
         .join("")
         .trim_end_matches(';')
-        .to_string();
-    joined
+        .to_string()
+}
+
+/// 从粘贴内容里抽出 cookie 的值。两种形态：
+///
+/// 1. `cookie: MUSIC_U=...; ...` —— DevTools 的请求头那一行原样贴进来。
+///    **只在开头认这个前缀**，因为值里恰好含 `cookie:` 是完全合法的输入
+///    （`MUSIC_U=abc; note=cookie:x`），按全文找会把 MUSIC_U 连同 `note=` 一起切掉。
+/// 2. 整段「复制为 cURL」命令：含引号才尝试——cURL 的参数一定带引号，
+///    而从 DevTools 直接抄下来的 cookie 串不带，这样普通的 `a=1;b=2` 不会被误伤。
+///    值的右边界取**第一个引号**（`-H` 的参数总被引号包住），
+///    后面 `-H 'user-agent: ...'` 之类的其它请求头不会被吸进来。
+fn extract_cookie_header(raw: &str) -> Option<&str> {
+    if let Some(rest) = strip_cookie_prefix(raw.trim_start()) {
+        if !rest.is_empty() {
+            return Some(rest);
+        }
+    }
+    if !raw.contains('\'') && !raw.contains('"') {
+        return None;
+    }
+    let at = raw.to_ascii_lowercase().find("cookie:")?;
+    let rest = &raw[at + "cookie:".len()..];
+    let end = rest.find(|c| c == '\'' || c == '"').unwrap_or(rest.len());
+    let value = rest[..end].trim();
+    (!value.is_empty()).then_some(value)
+}
+
+/// 输入以 `cookie:` 开头时返回它后面的部分（已 trim），否则 `None`。
+fn strip_cookie_prefix(raw: &str) -> Option<&str> {
+    const LABEL: &str = "cookie:";
+    // `get` 顺带挡住了「串比标签还短」和「不在字符边界上」两种情况
+    let head = raw.get(..LABEL.len())?;
+    head.eq_ignore_ascii_case(LABEL)
+        .then(|| raw[LABEL.len()..].trim())
+}
+
+/// 同名 cookie 只留第一条，返回 (去重后的串, 被丢掉的名字)。
+///
+/// 保留第一条而不是最后一条，是因为 `MUSIC_U` 在正常账号下只有一份
+/// （`.music.163.com` 那条），顺序对它没有影响；而重名最多的是 `__csrf`
+/// （`music.163.com` 和 `.163.com` 各一份），它的值我们根本不使用。
+///
+/// 万一真的出现多个 `MUSIC_U`，那就是「留哪条都可能不对」的情况了——
+/// 所以调用方要把 [`Credentials::dropped`] 报给用户，而不是默默选一个。
+fn dedupe(raw: &str) -> (String, Vec<String>) {
+    let mut kept: Vec<(&str, &str)> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for (k, v) in split_pairs(raw) {
+        if kept.iter().any(|(seen, _)| seen.eq_ignore_ascii_case(k)) {
+            dropped.push(k.to_string());
+        } else {
+            kept.push((k, v));
+        }
+    }
+    let joined = kept
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(";");
+    (joined, dropped)
 }
 
 /// 按 `;` 切开，返回 (键, 值)。用于替代到处手搓 `contains("MUSIC_U=")`。
@@ -306,6 +378,60 @@ mod tests {
         let mode = fs::metadata(&saved).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "凭据文件必须是 600，实际 {mode:o}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_cookie_names_collapse() {
+        // 浏览器会给同一个名字存多份（不同 domain/path），手抄时很容易全带上
+        let cred = Credentials::parse(
+            "_ntes_nuid=x; __csrf=aaa; MUSIC_U=secret; __csrf=bbb; __csrf=ccc",
+        )
+        .unwrap();
+        assert_eq!(cred.get("MUSIC_U"), Some("secret"));
+        assert_eq!(cred.get("__csrf"), Some("aaa"), "同名保留第一条");
+        assert_eq!(cred.dropped().len(), 2, "应当报出被丢掉的两条");
+        assert_eq!(cred.as_str().matches("__csrf=").count(), 1, "落盘的形态里不该再有重复");
+        assert!(cred.masked().contains("MUSIC_U=****（6 字符）"));
+
+        // 没有重名时不必虚报
+        assert!(Credentials::parse("MUSIC_U=a; os=pc").unwrap().dropped().is_empty());
+    }
+
+    #[test]
+    fn pasted_cookie_header_value_is_accepted() {
+        // 从 Network 面板抄「Cookie」这一行的值，会带上 `cookie: ` 前缀
+        let cred = Credentials::parse("cookie: MUSIC_U=abc; os=pc").unwrap();
+        assert_eq!(cred.get("MUSIC_U"), Some("abc"));
+        assert_eq!(cred.get("os"), Some("pc"));
+    }
+
+    #[test]
+    fn curl_paste_is_unwrapped() {
+        // 「复制为 cURL」整段贴进来也能认出来，且不把相邻的其它请求头吸进来
+        let blob = "curl 'https://music.163.com/weapi/playlist' \
+                    -H 'cookie: MUSIC_U=abc; __csrf=z' \
+                    -H 'user-agent: Mozilla/5.0'";
+        let cred = Credentials::parse(blob).unwrap();
+        assert_eq!(cred.get("MUSIC_U"), Some("abc"));
+        assert_eq!(cred.get("__csrf"), Some("z"));
+        assert_eq!(cred.get("user-agent"), None);
+    }
+
+    #[test]
+    fn cookie_label_is_read_case_insensitively() {
+        // 真实请求头里写的是 `Cookie:`，手抄时大小写都可能
+        // （「值里含 cookie: 的串不能被误伤」由下一个用例守着）
+        let cred = Credentials::parse("Cookie: MUSIC_U=abc").unwrap();
+        assert_eq!(cred.get("MUSIC_U"), Some("abc"));
+        assert_eq!(cred.as_str(), "MUSIC_U=abc", "标签本身不该被存进凭据");
+    }
+
+    #[test]
+    fn value_containing_the_word_cookie_is_not_mangled() {
+        // 没有引号就不做 cURL 解析，避免误伤值里恰好含 `cookie:` 的普通串
+        let cred = Credentials::parse("MUSIC_U=abc; note=cookie:x").unwrap();
+        assert_eq!(cred.get("MUSIC_U"), Some("abc"));
+        assert_eq!(cred.get("note"), Some("cookie:x"));
     }
 
     #[test]

@@ -152,6 +152,27 @@ impl Index {
             .collect()
     }
 
+    /// 这首歌所属的第一张歌单，用来决定它在音乐库里落在哪个目录。
+    ///
+    /// 收进索引层而不是留在调用方，是因为命令行和 Web 界面都要拿它算目录。
+    /// 两边各写一份 `find(|p| p.track_ids.contains(&id))`，迟早会有一边漏掉
+    /// 「同一首歌在两张歌单里」这种情形，然后同一个文件在磁盘上出现两份。
+    pub fn owning_playlist(&self, track_id: u64) -> Option<&Playlist> {
+        self.playlists
+            .values()
+            .find(|p| p.track_ids.contains(&track_id))
+    }
+
+    /// 记下一首**不属于任何歌单**的曲目的元数据（搜索结果、歌手热门那一类）。
+    ///
+    /// 只在索引里还没有它时写入——已经属于某张歌单的曲目不该被覆盖。
+    /// 没有这一步，点播一首搜到的歌之后它不会出现在 `info` 的统计里，
+    /// FUSE 的虚拟树里也看不到它。
+    pub fn remember_track(&mut self, track: Track) {
+        self.tracks.entry(track.key()).or_insert(track);
+        self.touch();
+    }
+
     /// 命令行里允许直接写数字 id，或写 `netease:123` 这样的完整 key。
     pub fn resolve_track(&self, query: &str) -> Option<&Track> {
         let q = query.trim();

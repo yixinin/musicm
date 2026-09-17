@@ -5,6 +5,8 @@
 //! 空名都会让它匹配失败）。所以这里从严处理。
 
 use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 
 use crate::model::Track;
 
@@ -19,6 +21,12 @@ const RESERVED: &[&str] = &[
 
 /// 单个路径段的字符上限。留足余量，避免路径总长撞上 260 / 4096 之类的限制。
 const MAX_CHARS: usize = 100;
+
+/// 每日推荐的落地目录名。
+///
+/// 命令行和 Web 界面都拿它去调 [`group_rel`]，所以两边算出的是同一个目录——
+/// 否则同一首日推曲目会在磁盘上存两份，而两边各看各的。
+pub const DAILY_GROUP: &str = "每日推荐";
 
 /// 把任意字符串压成一个安全的路径段。
 pub fn sanitize_component(raw: &str) -> String {
@@ -151,6 +159,38 @@ fn with_suffix(stem: &str, n: usize) -> String {
     format!("{head}{suffix}")
 }
 
+/// 目录里已经落地的文件主干名（不含扩展名）。
+///
+/// 每日推荐那类曲目不进索引，所以「这首下过没有」只能反查磁盘。主干仍然由
+/// [`unique_stems`] 给出，与写文件时是同一套规则，不会出现「文件明明在、
+/// 却认不出来」。
+///
+/// 去掉扩展名的规则与 `vfs::Node::stem()` 一致：只砍**最后一个**点号之后的部分，
+/// 歌名里的点号（`Mr.Children` 这种）要保住。
+///
+/// 收在这里而不是各自的调用点，是因为命令行和 Web 界面都要用它算同一个状态——
+/// 两份实现迟早会漂移，然后同一首曲子在一个界面上是「已下载」、另一个界面上不是。
+pub fn landed_stems(dir: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        // 目录还不存在时不能报错，只能是什么都没有
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // 下载中断留下的 `.xxx.part.mp3` 不算已落地
+        if name.starts_with('.') {
+            continue;
+        }
+        let stem = match name.rfind('.') {
+            Some(i) => name[..i].to_string(),
+            None => name,
+        };
+        out.insert(stem);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +281,28 @@ mod tests {
         let got = unique_stems(&src);
         let set: std::collections::HashSet<_> = got.iter().collect();
         assert_eq!(set.len(), got.len(), "生成了重名: {got:?}");
+    }
+
+    /// 日推目录的「已落地」反查。两个边界：下载中断的隐藏分片不算落地；
+    /// 歌名里的点号要保住（`Mr.Children` 这种砍错就永远认不出来）。
+    #[test]
+    fn landed_stems_skips_partials_and_keeps_dotted_names() {
+        let dir = std::env::temp_dir().join(format!("musicm_landed_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("01 Mr.Children - 歌手.mp3"), b"x").unwrap();
+        fs::write(dir.join("01 Mr.Children - 歌手.lrc"), b"x").unwrap();
+        fs::write(dir.join(".02 x - y.part.mp3"), b"x").unwrap();
+
+        let got = landed_stems(&dir);
+        assert!(got.contains("01 Mr.Children - 歌手"), "实际: {got:?}");
+        assert!(
+            !got.iter().any(|s| s.contains("part")),
+            "下载中的分片不该被当成已落地: {got:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        // 目录还不存在时不能报错，只能是什么都没有
+        assert!(landed_stems(&dir).is_empty());
     }
 }

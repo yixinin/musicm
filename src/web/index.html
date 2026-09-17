@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>musicm · 音乐库管理</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div id="gate" class="gate hidden">
+  <div class="gate-box">
+    <h1>需要访问令牌</h1>
+    <p>这个 musicm 监听在局域网地址上，启动时生成了一个访问令牌，并把带令牌的链接打印在终端里。</p>
+    <p class="dim">终端里的那行「打开 http://…/?token=…」直接点开即可；也可以把令牌粘到这里。</p>
+    <input id="gate-token" type="text" placeholder="粘贴访问令牌" autocomplete="off">
+    <button class="primary" id="gate-ok">进入</button>
+    <p class="gate-error" id="gate-error"></p>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="live-dot"></span>
+      <strong>musicm</strong>
+      <span class="dim">音乐库管理</span>
+    </div>
+    <div class="topbar-right">
+      <span class="chip" id="login-chip">—</span>
+      <span class="chip" id="platform-chip">—</span>
+      <button class="ghost" id="jobs-toggle">任务 <span class="badge" id="jobs-badge">0</span></button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidebar">
+      <button class="nav active" data-view="dashboard">概览</button>
+      <button class="nav" data-view="search">搜索</button>
+      <button class="nav" data-view="library">音乐库</button>
+      <button class="nav" data-view="daily">每日推荐</button>
+      <button class="nav" data-view="account">账号</button>
+      <button class="nav" data-view="mount">挂载</button>
+    </nav>
+
+    <main class="content">
+      <div id="banner" class="banner hidden"></div>
+
+      <section class="view active" data-view="dashboard">
+        <h1>概览</h1>
+        <div class="cards" id="dash-cards"></div>
+        <div class="panel" id="dash-mount"></div>
+        <div class="panel">
+          <h2>路径与配置</h2>
+          <dl class="kv" id="dash-paths"></dl>
+        </div>
+      </section>
+
+      <section class="view" data-view="search">
+        <h1>搜索</h1>
+        <div class="toolbar">
+          <input id="search-input" type="text" placeholder="歌名 / 歌手 / 歌单名" autocomplete="off">
+          <select id="search-type">
+            <option value="all">全部</option>
+            <option value="song">单曲</option>
+            <option value="playlist">歌单</option>
+            <option value="artist">歌手</option>
+          </select>
+          <button class="primary" id="search-go">搜索</button>
+        </div>
+        <div id="search-result" class="results"></div>
+      </section>
+
+      <section class="view" data-view="library">
+        <h1>音乐库</h1>
+        <div class="toolbar">
+          <input id="scan-input" type="text" placeholder="歌单 id（也从搜索结果里点「扫描」）" autocomplete="off">
+          <button class="primary" id="scan-go">扫描歌单</button>
+          <button id="mine-go">列出我的歌单</button>
+        </div>
+        <div id="library-result" class="results"></div>
+      </section>
+
+      <section class="view" data-view="daily">
+        <h1>每日推荐</h1>
+        <div class="toolbar">
+          <button class="primary" id="daily-go">获取今日推荐</button>
+          <button id="daily-download" disabled>下载选中的曲目</button>
+        </div>
+        <p class="dim" id="daily-note">每日推荐需要先登录。这些曲目不进索引，只落地到「网易云/每日推荐」目录。</p>
+        <div id="daily-result" class="results"></div>
+      </section>
+
+      <section class="view" data-view="account">
+        <h1>账号</h1>
+        <div class="panel" id="account-state"></div>
+        <div class="panel">
+          <h2>用 cookie 登录</h2>
+          <p class="dim">
+            扫码登录目前被网易云的风控挡住了（会返回「需要行为验证码」），所以这里只走 cookie 粘贴。
+            做法：浏览器登录 music.163.com → F12 打开 Network → 随便点一个请求 →
+            在 Request Headers 里复制 <code>Cookie</code> 那一整行的值。
+            里面必须包含 <code>MUSIC_U</code>，否则不算登录态。
+          </p>
+          <textarea id="cookie-input" rows="5" placeholder="MUSIC_U=...; __csrf=...; os=pc"></textarea>
+          <div class="toolbar">
+            <button class="primary" id="login-go">保存并校验</button>
+            <button id="whoami-go">检查登录状态</button>
+            <button class="danger" id="logout-go">清除凭据</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" data-view="mount">
+        <h1>挂载</h1>
+        <div class="panel" id="mount-state"></div>
+        <div class="panel">
+          <h2>挂载参数</h2>
+          <div class="form">
+            <label>挂载点
+              <input id="mount-point" type="text" placeholder="/vol1/1000/music" autocomplete="off">
+            </label>
+            <label>模式
+              <select id="mount-mode">
+                <option value="cached">cached（只列已落盘，零网络）</option>
+                <option value="ondemand">ondemand（列出全部，首读取回）</option>
+              </select>
+            </label>
+            <label class="check">
+              <input id="mount-allow-other" type="checkbox"> allow_other（飞牛音乐以别的用户跑，开这个才扫得到）
+            </label>
+            <label>事件循环线程数
+              <input id="mount-threads" type="number" min="1" max="16" value="4">
+            </label>
+          </div>
+          <div class="toolbar">
+            <button class="primary" id="mount-go">挂载</button>
+            <button class="danger" id="unmount-go">卸载</button>
+          </div>
+          <p class="dim">
+            给飞牛音乐扫描用 <strong>cached</strong>：ondemand 模式下「扫一遍整库」会变成把整个歌单下载一遍。
+            挂载需要 Linux + <code>fuse3</code>（<code>apt install fuse3</code>）。
+          </p>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<aside id="jobs-drawer" class="drawer hidden">
+  <div class="drawer-head">
+    <strong>任务</strong>
+    <button class="ghost" id="jobs-close">关闭</button>
+  </div>
+  <div id="jobs-list"></div>
+</aside>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
