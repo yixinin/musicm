@@ -11,11 +11,13 @@
 //! 这个安排是为了让开发机上的 `cargo build` 能编到其中的一半，
 //! 另一半由 `tools/linuxcheck` 对着 aarch64-linux 编（详见 `mount.rs` 的文档）。
 
+mod auth;
 mod config;
 mod fetch;
 mod model;
 mod naming;
 mod netease;
+mod qr;
 mod store;
 mod tag;
 
@@ -33,17 +35,21 @@ mod vfs;
 #[cfg(target_os = "linux")]
 mod fuse_fs;
 
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::auth::{Credentials, Origin};
 use crate::config::{Config, Quality};
 use crate::fetch::Fetcher;
 use crate::model::Playlist;
 use crate::mount::MountArgs;
-use crate::netease::NeteaseClient;
+use crate::netease::{NeteaseClient, QrState};
 use crate::store::Index;
 
 #[derive(Parser, Debug)]
@@ -64,10 +70,6 @@ struct Cli {
     /// 音质档位：standard / higher / exhigh / lossless。给了就写入配置，后续沿用。
     #[arg(long, global = true)]
     quality: Option<String>,
-
-    /// 网易云 cookie（至少包含 MUSIC_U）。给了就写入配置，后续沿用。
-    #[arg(long, global = true)]
-    cookie: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -119,8 +121,35 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         threads: usize,
     },
+    /// 保存登录凭据，解锁会员曲目
+    Login {
+        /// 直接给 cookie 串（会留在 shell 历史里）
+        #[arg(long)]
+        cookie: Option<String>,
+        /// 从文件读取 cookie
+        #[arg(long)]
+        cookie_file: Option<PathBuf>,
+        /// 扫码登录：在终端里直接画出二维码，用手机网易云音乐 App 扫
+        #[arg(long)]
+        qr: bool,
+        /// 扫码等待秒数
+        #[arg(long, default_value_t = 300)]
+        qr_timeout: u64,
+    },
+    /// 删除本地保存的凭据
+    Logout,
+    /// 联网确认登录态（昵称 / uid / 会员等级）
+    Whoami,
     /// 查看配置与索引状态
     Info,
+}
+
+/// `login` 的参数。抽成结构体是因为命令行那层要传进来的分支比较多。
+struct LoginArgs {
+    cookie: Option<String>,
+    cookie_file: Option<PathBuf>,
+    qr: bool,
+    qr_timeout: u64,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,15 +193,36 @@ fn run(cli: Cli) -> Result<()> {
             dirty = true;
         }
     }
-    if let Some(cookie) = cli.cookie {
-        cfg.cookie = Some(cookie);
-        dirty = true;
-    }
     if dirty {
         cfg.save()?;
     }
 
+    // 旧版本把 cookie 明文写在 config.json 里，Config::load 已经把它搬进凭据文件了。
+    // 这件事必须说出来——用户以为自己改的是那个文件，得让他知道位置变了。
+    if cfg.cookie_origin == Origin::Migrated {
+        println!(
+            "凭据已迁移到 {}（config.json 里的那份明文已清除）",
+            auth::path(&cfg.data_dir).display()
+        );
+    }
+
     match cli.command {
+        Command::Login {
+            cookie,
+            cookie_file,
+            qr,
+            qr_timeout,
+        } => cmd_login(
+            &cfg,
+            LoginArgs {
+                cookie,
+                cookie_file,
+                qr,
+                qr_timeout,
+            },
+        ),
+        Command::Logout => cmd_logout(&cfg),
+        Command::Whoami => cmd_whoami(&cfg),
         Command::Info => cmd_info(&cfg),
         Command::Scan { playlist_id } => cmd_scan(&cfg, playlist_id),
         Command::Playlists => cmd_playlists(&cfg),
@@ -196,6 +246,180 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
+// ---------- 登录 ----------
+
+fn cmd_login(cfg: &Config, args: LoginArgs) -> Result<()> {
+    if args.qr {
+        return login_by_qr(cfg, args.qr_timeout);
+    }
+
+    let raw = read_cookie_input(&args)?;
+    let cred = Credentials::parse(&raw)?;
+    let saved = auth::save(&cfg.data_dir, cred.as_str())?;
+
+    println!("凭据已保存到 {}", saved.display());
+    #[cfg(unix)]
+    println!("权限       600（仅属主可读）");
+    println!("内容       {}", cred.masked());
+    println!();
+
+    // 保存成功不等于凭据有效，顺手联网确认一次。
+    // 这一步失败不影响已经保存的凭据，所以只警告不报错。
+    match NeteaseClient::new(cfg)?.account() {
+        Ok(Some(acc)) => print_account(&acc),
+        Ok(None) => {
+            println!("⚠ 凭据已保存，但账号接口没认出登录态。");
+            println!("  多半是 MUSIC_U 复制不全或已过期，重新登录一次再试。");
+        }
+        Err(e) => println!("⚠ 已保存，但联网确认失败（不影响后续使用）：{e:#}"),
+    }
+    Ok(())
+}
+
+/// 从 `--cookie` / `--cookie-file` / 标准输入三处之一取 cookie。
+///
+/// 管道那条路是刻意留的：`pbpaste | musicm login` 不会把凭据留在 shell 历史里。
+fn read_cookie_input(args: &LoginArgs) -> Result<String> {
+    if let Some(raw) = &args.cookie {
+        return Ok(raw.clone());
+    }
+    if let Some(path) = &args.cookie_file {
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("读取 cookie 文件失败: {}", path.display()));
+    }
+    if !std::io::stdin().is_terminal() {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("从标准输入读取 cookie 失败")?;
+        if !buf.trim().is_empty() {
+            return Ok(buf);
+        }
+    }
+    bail!(
+        "没有拿到 cookie。三种给法：\n\
+         1) musicm login --qr            扫码登录（推荐）\n\
+         2) pbpaste | musicm login       浏览器里复制后管道进来\n\
+         3) musicm login --cookie 'MUSIC_U=...'（会留在 shell 历史里）"
+    )
+}
+
+/// 扫码登录。
+///
+/// 全程走**不加密**的 `/api/login/qrcode/*`，所以不需要自建服务、也不需要在 Rust
+/// 里实现 weapi/eapi 加密（那件事仍然留给自建服务）。
+fn login_by_qr(cfg: &Config, timeout_secs: u64) -> Result<()> {
+    let client = NeteaseClient::new(cfg)?;
+    let (key, url) = client.qr_key()?;
+
+    for line in qr::render_lines(&url)? {
+        println!("{line}");
+    }
+    println!();
+    println!("用网易云音乐 App 扫码授权（我 → 右上角 → 扫一扫）");
+    println!("二维码内容 {url}");
+    println!("向上滚动要小心：二维码滚出屏幕就没法扫了\n");
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut seen: Option<QrState> = None;
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_secs(2));
+        let poll = client.qr_poll(&key)?;
+
+        // 状态没变就不刷屏，只在跳变时吭声
+        if seen != Some(poll.state) {
+            match poll.state {
+                QrState::Waiting => println!("等待扫码…"),
+                QrState::Scanned => println!("已扫码，请在手机上确认登录"),
+                // 把原始返回打出来：不然接口行为一变，用户就只能干等 5 分钟
+                QrState::Unknown => println!(
+                    "接口返回了预期外的状态（code={}，{}），继续等待…",
+                    poll.code,
+                    poll.message.trim()
+                ),
+                _ => {}
+            }
+            seen = Some(poll.state);
+        }
+
+        match poll.state {
+            QrState::Confirmed => {
+                let raw = poll
+                    .cookie
+                    .ok_or_else(|| anyhow!("授权成功，但接口没有下发凭据（Set-Cookie 是空的）"))?;
+                let cred = Credentials::parse(&raw).map_err(|e| {
+                    anyhow!("接口下发的凭据不完整：{e:#}。原始内容长度 {} 字符", raw.len())
+                })?;
+                let saved = auth::save(&cfg.data_dir, cred.as_str())?;
+
+                println!("\n登录成功");
+                println!("凭据已保存到 {}", saved.display());
+                match client.account() {
+                    Ok(Some(acc)) => print_account(&acc),
+                    _ => println!("账号       （已保存，但这次没读到账号信息）"),
+                }
+                return Ok(());
+            }
+            QrState::Expired => bail!("二维码已过期，重新执行 `musicm login --qr`"),
+            _ => {}
+        }
+    }
+    bail!("等待 {timeout_secs} 秒仍未确认，二维码已作废。重新执行 `musicm login --qr`")
+}
+
+fn print_account(acc: &crate::netease::Account) {
+    println!("账号       {}（uid {}）", acc.nickname, acc.uid);
+    println!(
+        "会员       {}",
+        match acc.vip_type {
+            0 => "非会员（会员曲目仍拿不到链接）".to_string(),
+            other => format!("vipType={other}"),
+        }
+    );
+}
+
+fn cmd_logout(cfg: &Config) -> Result<()> {
+    let target = auth::path(&cfg.data_dir);
+    if auth::clear(&cfg.data_dir)? {
+        println!("已删除 {}", target.display());
+    } else {
+        println!("本来就没有保存过凭据");
+    }
+    if cfg.cookie_origin == Origin::Env {
+        println!("提醒：MUSICM_COOKIE 环境变量仍然生效，本次运行依旧带着登录态");
+    }
+    Ok(())
+}
+
+fn cmd_whoami(cfg: &Config) -> Result<()> {
+    println!("凭据来源   {}", cfg.cookie_origin.label());
+    if cfg.cookie.is_some() {
+        println!("凭据内容   {}", cfg.describe_login());
+    }
+    println!("音源接入   {}", cfg.api.describe());
+    println!();
+
+    let client = NeteaseClient::new(cfg)?;
+    match client.account()? {
+        Some(acc) => {
+            println!("状态       已登录");
+            print_account(&acc);
+            Ok(())
+        }
+        None => {
+            // 网易云不会明说「凭据过期」，只把 profile 返回成 null，
+            // 所以这里也分不清到底是没配还是过期了，只能把两种可能都摆出来。
+            println!("状态       未登录");
+            if cfg.cookie.is_some() {
+                println!("原因       凭据没被认可，多半已过期。重新执行 `musicm login --qr`");
+            } else {
+                println!("原因       没有配置凭据。`musicm login --qr` 可以扫码登录");
+            }
+            Ok(())
+        }
+    }
+}
+
 // ---------- 子命令实现 ----------
 
 fn cmd_info(cfg: &Config) -> Result<()> {
@@ -209,14 +433,17 @@ fn cmd_info(cfg: &Config) -> Result<()> {
     println!("  索引文件   {}", cfg.index_path().display());
     println!("  音源接入   {}", cfg.api.describe());
     println!("  音质档位   {}", cfg.quality.as_str());
-    println!(
-        "  登录态     {}",
-        if cfg.has_login() {
-            "已配置 cookie"
-        } else {
-            "未配置 cookie（只能取到免费档曲目）"
-        }
-    );
+    println!("  凭据来源   {}", cfg.cookie_origin.label());
+    println!("  凭据内容   {}", cfg.describe_login());
+    if cfg.cookie.is_some() {
+        println!("  凭据文件   {}", auth::path(&cfg.data_dir).display());
+    }
+    if !cfg.has_login() {
+        println!("  提示       没有登录态时只能取到免费档曲目；`musicm login --qr` 可扫码登录");
+    }
+    if cfg.cookie_origin.is_ephemeral() {
+        println!("  注意       这份凭据来自本次运行的参数/环境变量，换个终端就没了");
+    }
 
     println!("\n索引");
     println!("  歌单       {}", stats.playlists);

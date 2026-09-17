@@ -124,13 +124,24 @@ pub struct Config {
     /// 音乐文件落地根目录
     pub out_root: PathBuf,
     pub api: ApiMode,
-    /// 网易云 cookie，至少需要 MUSIC_U
-    #[serde(default)]
+    /// 网易云 cookie，至少需要 MUSIC_U。
+    ///
+    /// **这个字段是只读的兼容入口**：能从旧的 `config.json` 读进来，但永远不会再被
+    /// 写回去（`skip_serializing`）——凭据不该躺在明文配置里。加载时会迁移到
+    /// `cookie.txt`（权限 600），运行期要读 cookie 请用 [`Config::credentials`]。
+    ///
+    /// 注意别写成 `skip_serializing_if = "Option::is_none"`：那个的语义是
+    /// 「**是 None 时**跳过」，也就是 `Some` 时照样写出去，等于没保护。
+    #[serde(default, skip_serializing)]
     pub cookie: Option<String>,
     pub quality: Quality,
     pub embed_cover: bool,
     pub write_lrc: bool,
     pub embed_lyrics: bool,
+
+    /// cookie 的来源，只存在于内存里，不落盘。
+    #[serde(skip)]
+    pub cookie_origin: crate::auth::Origin,
 }
 
 impl Default for Config {
@@ -145,6 +156,7 @@ impl Default for Config {
             embed_cover: true,
             write_lrc: true,
             embed_lyrics: true,
+            cookie_origin: crate::auth::Origin::None,
         }
     }
 }
@@ -187,12 +199,44 @@ impl Config {
         }
 
         cfg.apply_env();
+        cfg.resolve_cookie()?;
         Ok(cfg)
+    }
+
+    /// 定下这次运行用哪份 cookie。
+    ///
+    /// 优先级：环境变量 > `cookie.txt` > `config.json` 里的旧明文。
+    /// （命令行的 `--cookie` 由 `main` 在这之后覆盖，优先级最高。）
+    ///
+    /// 如果只找到了 `config.json` 里的旧明文，顺手把它搬进 `cookie.txt`——
+    /// 这是老用户升级后唯一会走到迁移的路径，迁移失败要报错而不是默默丢掉凭据。
+    fn resolve_cookie(&mut self) -> Result<()> {
+        if self.cookie_origin == crate::auth::Origin::Env {
+            return Ok(());
+        }
+
+        if let Some(stored) = crate::auth::load(&self.data_dir)? {
+            self.cookie = Some(stored);
+            self.cookie_origin = crate::auth::Origin::File;
+            return Ok(());
+        }
+
+        if let Some(legacy) = self.cookie.clone() {
+            crate::auth::save(&self.data_dir, &legacy)?;
+            self.cookie = Some(legacy);
+            self.cookie_origin = crate::auth::Origin::Migrated;
+            // 重写一次 config.json，把原来的明文摘掉（cookie 字段是 skip_serializing）
+            self.save()?;
+        } else {
+            self.cookie_origin = crate::auth::Origin::None;
+        }
+        Ok(())
     }
 
     fn apply_env(&mut self) {
         if let Some(v) = env_nonempty("MUSICM_COOKIE") {
             self.cookie = Some(v);
+            self.cookie_origin = crate::auth::Origin::Env;
         }
         if let Some(v) = env_nonempty("MUSICM_API_BASE") {
             self.api = ApiMode::Sidecar { base: v };
@@ -217,17 +261,37 @@ impl Config {
     /// 整理成可直接塞进请求头的形式。
     /// 从浏览器复制 cookie 时经常带上换行，这里统一清掉。
     pub fn cookie_header(&self) -> Option<String> {
-        self.cookie.as_ref().map(|c| {
-            c.split_whitespace()
-                .collect::<Vec<_>>()
-                .join("")
-        }).filter(|c| !c.is_empty())
+        let normalized = crate::auth::normalize(self.cookie.as_deref()?);
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
     }
 
+    /// 凭据是否构成登录态。
+    ///
+    /// 只判断有没有 `MUSIC_U`——**它是否还有效必须联网才知道**
+    /// （见 `NeteaseClient::account`）：网易云对失效 cookie 不会报错，
+    /// 只是把 `profile` 返回成 null，本地看不出来。
     pub fn has_login(&self) -> bool {
-        self.cookie_header()
-            .map(|c| c.contains("MUSIC_U="))
-            .unwrap_or(false)
+        self.credentials().is_some()
+    }
+
+    /// 解析过的凭据。cookie 存在但里面没有 `MUSIC_U` 时返回 `None`。
+    pub fn credentials(&self) -> Option<crate::auth::Credentials> {
+        crate::auth::Credentials::parse(self.cookie.as_deref()?).ok()
+    }
+
+    /// 给 `info` 用的一行描述，不联网。
+    pub fn describe_login(&self) -> String {
+        let Some(raw) = self.cookie.as_deref() else {
+            return "未配置".to_string();
+        };
+        match crate::auth::Credentials::parse(raw) {
+            Ok(cred) => cred.masked(),
+            Err(_) => "⚠ 有 cookie 但不含 MUSIC_U，不会解锁会员曲目".to_string(),
+        }
     }
 }
 

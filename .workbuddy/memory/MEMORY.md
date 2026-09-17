@@ -80,19 +80,44 @@ cd tools/linuxcheck && cargo check --target aarch64-unknown-linux-gnu
 原理、自查清单与「怎么证明检查器没在骗你」见技能 `rust-cross-target-check`。
 三个命令一起跑才算完：`cargo build` + `cargo test` + 上面这条。
 
+**必须在 `tools/linuxcheck/` 里跑，不能在仓库根目录跑。** 根目录的 `musicm` crate
+依赖 `ring`，`cargo check --target aarch64-…` 会去找 `aarch64-linux-gnu-gcc`
+然后 `error: failed to run custom build command for ring` —— 那是选错了目录，不是代码有问题。
+`linuxcheck` 刻意只留纯 Rust 依赖（`anyhow`/`serde`/`serde_json`/`qrcode` + Linux 段的 `fuser`/`libc`）。
+
+当前被检查的模块：`model` `auth` `qr` `config` `naming` `store` `vfs` `fuse_fs` `mount`。
+`auth.rs` 里的 `write_private`/`harden` 是 `#[cfg(unix)]`——**只在交叉检查里才编得到**，
+所以动凭据落盘逻辑后必须跑这一条，宿主的 `cargo build` 对它一无所知。
+
 ## Milestone status
 
 - ✅ M0 打通音源（直连匿名接口）
 - ✅ M1 歌单扫描 + 索引持久化
 - ✅ M2 单曲落地（取链 → 下载 → 打标 → 歌词/封面）
 - ✅ M4a FUSE 出口（只读、按需取回、树骨架已用真实数据验证）
+- ✅ M5a 登录凭据：扫码登录（QR）+ 凭据文件 + 双模式（Direct / Sidecar）已实测
 - ⬜ M3 缓存配额与预取队列（`--fuse-mode ondemand` 的体验取决于它）
 - ⬜ M4b WebDAV 出口（飞牛远程挂载，零 root 更优先）
-- ⬜ M5 cookie 登录态 + `ApiMode::Sidecar`（解灰/无损）
+- ⬜ M5b 无损/母带真正落地（登录态已通，还需验证 VIP 曲目取链成功率）
 - ⬜ M6 QQ 音乐音源 + 跨源合并去重
+
+## 凭据与登录（M5a，已实现）
+
+- **扫码登录不需要实现 weapi/eapi 加密**：直连 `https://music.163.com/api/login/qrcode/*`
+  在 crypto='' 的明文路径下就能用。两套端点映射（Direct / Sidecar）见技能 `netease-music-api` 第九节。
+- cookie **单独存 `<data_dir>/cookie.txt`**，Unix 下 600，绝不回写 `config.json`。
+  为此 `Config::cookie` 用的是 `#[serde(default, skip_serializing)]`——
+  **不是** `skip_serializing_if = "Option::is_none"`（那个只跳过 `None`，明文照样落盘，踩过）。
+- 凭据来源要能报出来（环境变量 / 文件 / 从 config.json 迁移），见 `auth::Origin`。
+  失效时用户才知道该去清哪里。
+- `--cookie` **只属于 `login` 命令**，没有全局同名参数。曾经两处都有，一次调用写两遍。
 
 ## CLI surface
 
 `scan <歌单id>` · `playlists` · `tracks <歌单id> [--limit]` · `url <曲目id>` ·
-`play <曲目id> [--force]` · `mount <挂载点> [--fuse-mode ondemand|cached] [--allow-other] [--threads N]` · `info`
-全局参数 `--data-dir / --out / --quality / --cookie`，**给了就写入配置并沿用**。
+`play <曲目id> [--force]` · `mount <挂载点> [--fuse-mode ondemand|cached] [--allow-other] [--threads N]` ·
+`login [--qr] [--cookie <串> | --cookie-file <路径>]` · `logout` · `whoami` · `info`
+全局参数 `--data-dir / --out / --quality`，**给了就写入配置并沿用**。
+
+`whoami` 会真的联网问一次账号接口（区分「有没有登录」与「登录是否还有效」），
+所以离线时它会失败——这是刻意的，它就是个探针。

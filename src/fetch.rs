@@ -107,9 +107,9 @@ impl<'a> Fetcher<'a> {
         let logged_in = self.client.logged_in();
         let info = resolved.info.ok_or_else(|| {
             let hint = if needs_login && !logged_in {
-                "这是会员或数字专辑曲目，需要登录态；用 --cookie 或环境变量 MUSICM_COOKIE 提供 MUSIC_U"
-            } else if logged_in {
-                "cookie 已经配了，说明该曲目在源站确实无版权或已下架"
+                "这是会员或数字专辑曲目，需要登录态；执行 `musicm login --qr` 扫码登录即可解锁"
+            } else if needs_login {
+                "已经配了凭据却仍拿不到，多半是它过期了：用 `musicm whoami` 确认，`musicm login --qr` 重新登录"
             } else {
                 "该曲目在源站无版权或已下架"
             };

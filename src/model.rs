@@ -12,6 +12,15 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// 毫秒时间戳。扫码轮询要带它——自建 API 服务按 URL 做 2 分钟粒度的缓存，
+/// 不带这个参数会一直读到 `801 等待扫码` 的缓存副本。
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 一首曲目。字段命名与虚拟文件树的生成规则一一对应。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Track {

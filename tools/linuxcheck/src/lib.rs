@@ -40,6 +40,14 @@
 #[path = "../../../src/model.rs"]
 pub mod model;
 
+// 纯 std + anyhow，没有 C 依赖，所以可以（也应该）参与交叉检查：
+// 里面的 Unix 权限分支只有在这里才编得到。
+#[path = "../../../src/auth.rs"]
+pub mod auth;
+
+#[path = "../../../src/qr.rs"]
+pub mod qr;
+
 #[path = "../../../src/config.rs"]
 pub mod config;
 

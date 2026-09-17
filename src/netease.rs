@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 use crate::config::{ApiMode, Config, Quality};
-use crate::model::{AudioInfo, Playlist, Track, now_secs};
+use crate::model::{AudioInfo, Playlist, Track, now_millis, now_secs};
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
 /// 曲目元数据批量查询时每批的数量。
@@ -49,6 +49,90 @@ impl UrlOutcome {
     /// 这类结果值得提示用户去配 cookie。
     pub fn needs_login(&self) -> bool {
         matches!(self.code, -110 | 200) && self.info.is_none()
+    }
+}
+
+/// 账号信息。只取展示需要的字段。
+#[derive(Debug, Clone)]
+pub struct Account {
+    pub uid: u64,
+    pub nickname: String,
+    /// 0 = 非会员；11 = 黑胶 VIP。取值随版本漂移，所以只原样展示不解读。
+    pub vip_type: i32,
+}
+
+/// 扫码状态。网易云用 800~803 表示。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QrState {
+    /// 801：还没人扫
+    Waiting,
+    /// 802：扫了，等手机端确认
+    Scanned,
+    /// 803：确认成功，凭据已下发
+    Confirmed,
+    /// 800：二维码过期
+    Expired,
+    /// 其它，包括自建服务返回空响应的情况——继续轮询即可
+    Unknown,
+}
+
+impl QrState {
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            801 => QrState::Waiting,
+            802 => QrState::Scanned,
+            803 => QrState::Confirmed,
+            800 => QrState::Expired,
+            _ => QrState::Unknown,
+        }
+    }
+}
+
+/// 一次扫码状态查询的结果。
+#[derive(Debug, Clone)]
+pub struct QrPoll {
+    pub state: QrState,
+    pub code: i32,
+    pub message: String,
+    /// 只在 `Confirmed` 时有值。
+    pub cookie: Option<String>,
+}
+
+impl QrPoll {
+    fn new(code: i32, message: String, cookie: Option<String>) -> Self {
+        QrPoll {
+            state: QrState::from_code(code),
+            code,
+            message,
+            cookie,
+        }
+    }
+}
+
+/// 扫码内容。自建服务的 `/login/qr/create` 拼的就是这个串，所以两边共用。
+pub fn login_qr_url(key: &str) -> String {
+    format!("https://music.163.com/login?codekey={key}")
+}
+
+/// `Set-Cookie` 形如 `MUSIC_U=xxx; Path=/; Domain=.music.163.com; HttpOnly`，
+/// 只保留第一段键值对。注意不能按 `;` 全切——后面那些属性也带 `=`。
+fn cookie_pair(set_cookie: &str) -> String {
+    set_cookie
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// 错误信息里放一小段响应正文，够定位问题又不至于刷屏。
+fn snippet(text: &str) -> String {
+    let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut: String = one_line.chars().take(160).collect();
+    if one_line.chars().count() > 160 {
+        format!("{cut}…")
+    } else {
+        cut
     }
 }
 
@@ -167,6 +251,45 @@ impl NeteaseClient {
         Ok(written)
     }
 
+    /// 发一次 POST 表单，返回（响应体, 所有 Set-Cookie）。
+    ///
+    /// 登录相关接口都是 POST 表单。`Set-Cookie` 必须单独取出来：
+    /// 扫码成功的凭据就在里面，不在响应体里。
+    fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<(String, Vec<String>)> {
+        self.throttle();
+        let mut req = self
+            .agent
+            .post(url)
+            .header("User-Agent", UA)
+            .header("Referer", "https://music.163.com/");
+        if let Some(cookie) = &self.cookie {
+            req = req.header("Cookie", cookie);
+        }
+        let mut resp = req
+            .send_form(form.iter().copied())
+            .with_context(|| format!("请求失败: {url}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!("接口返回 HTTP {}", status.as_u16()));
+        }
+        // 先把响应头收完（不可变借用结束），再去拿 body（需要可变借用）
+        let cookies: Vec<String> = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut body = String::new();
+        resp.body_mut()
+            .as_reader()
+            .read_to_string(&mut body)
+            .context("读取响应体失败")?;
+        Ok((body, cookies))
+    }
+
     // ---------- 歌单 ----------
 
     pub fn playlist_detail(&self, id: u64) -> Result<(Playlist, Vec<Track>)> {
@@ -277,16 +400,21 @@ impl NeteaseClient {
 
     /// 取播放链接。单个档位一次请求，拿不到由上层走降级链。
     pub fn song_url(&self, id: u64, quality: Quality) -> Result<UrlOutcome> {
-        let query = format!(
-            "ids=%5B{id}%5D&br={}&level={}&encodeType={}",
-            quality.br(),
-            quality.as_str(),
-            if quality == Quality::Lossless {
-                "flac"
-            } else {
-                "mp3"
-            }
-        );
+        // 两种服务认的参数不一样：老接口认 br + encodeType，自建服务只认 level。
+        // 参数名也不同（`ids` vs `id`），所以不能共用一套。
+        let query = match &self.mode {
+            ApiMode::Direct => format!(
+                "ids=%5B{id}%5D&br={}&level={}&encodeType={}",
+                quality.br(),
+                quality.as_str(),
+                if quality == Quality::Lossless {
+                    "flac"
+                } else {
+                    "mp3"
+                }
+            ),
+            ApiMode::Sidecar { .. } => format!("id={id}&level={}", quality.as_str()),
+        };
         let url = self.url(self.mode.url_path(), &query);
         let text = self.get_text(&url)?;
         let env: UrlEnvelope = serde_json::from_str(&text).context("播放链接响应解析失败")?;
@@ -303,8 +431,14 @@ impl NeteaseClient {
         let raw_url = entry.url.unwrap_or_default();
         if raw_url.is_empty() {
             let reason = match entry.code {
-                -110 => "需要登录态（会员或数字专辑曲目）".to_string(),
-                -447 => "需要登录态：接口触发了风控，请降低频率或配置 cookie".to_string(),
+                // 同一个 -110 有两种成因，提示要分开——否则用户会去重装 cookie 却发现没用
+                -110 if self.logged_in() => {
+                    "需要登录态：cookie 可能已失效（用 `musicm whoami` 确认），\
+                     或该曲目需要更高等级会员 / 数字专辑"
+                        .to_string()
+                }
+                -110 => "需要登录态（会员或数字专辑曲目）：用 `musicm login` 配置 cookie".to_string(),
+                -447 => "接口触发风控：降低频率，或换一个有效的 cookie".to_string(),
                 0 | 200 => "暂无版权或已下架".to_string(),
                 other => format!("接口返回 code={other}"),
             };
@@ -364,6 +498,97 @@ impl NeteaseClient {
             },
             notes,
         ))
+    }
+
+    // ---------- 登录 ----------
+
+    /// 查账号信息。
+    ///
+    /// 返回 `None` 表示当前 cookie **不构成有效登录**。这个判断只能联网得到：
+    /// 网易云对匿名访问和失效 cookie 都返回 `code:200` + `profile:null`，
+    /// 不会给出「凭据过期」这种错误码，本地看不出来。
+    pub fn account(&self) -> Result<Option<Account>> {
+        let path = match &self.mode {
+            ApiMode::Direct => "/nuser/account/get",
+            ApiMode::Sidecar { .. } => "/login/status",
+        };
+        let url = self.url(path, &format!("timestamp={}", now_millis()));
+        let text = self.get_text(&url)?;
+        let env: AccountEnvelope =
+            serde_json::from_str(&text).context("账号信息响应解析失败，接口结构可能变了")?;
+        Ok(env.pick())
+    }
+
+    /// 申请一个扫码登录用的 key，返回（key, 二维码内容）。
+    ///
+    /// 二维码内容两端都是自己拼的：自建服务的 `/login/qr/create` 做的就是同一件事
+    /// （`https://music.163.com/login?codekey=<key>`），少一次网络往返就少一个失败点。
+    pub fn qr_key(&self) -> Result<(String, String)> {
+        let text = match &self.mode {
+            ApiMode::Direct => {
+                let url = self.url("/login/qrcode/unikey", "");
+                self.post_form(&url, &[("type", "3")])?.0
+            }
+            ApiMode::Sidecar { .. } => {
+                // 自建服务会按 2 分钟粒度缓存响应，必须带 timestamp 打破缓存
+                let url = self.url(
+                    "/login/qr/key",
+                    &format!("timestamp={}", now_millis()),
+                );
+                self.get_text(&url)?
+            }
+        };
+        let env: QrKeyEnvelope =
+            serde_json::from_str(&text).context("扫码 key 响应解析失败")?;
+        let key = env.pick().ok_or_else(|| {
+            anyhow!("接口没返回扫码 key，响应片段: {}", snippet(&text))
+        })?;
+        let url = login_qr_url(&key);
+        Ok((key, url))
+    }
+
+    /// 轮询扫码状态。调用方自己控制节奏与超时。
+    pub fn qr_poll(&self, key: &str) -> Result<QrPoll> {
+        let stamp = now_millis();
+        match &self.mode {
+            ApiMode::Direct => {
+                let url = self.url(
+                    "/login/qrcode/client/login",
+                    &format!("timestamp={stamp}"),
+                );
+                let (body, cookies) = self.post_form(&url, &[("key", key), ("type", "3")])?;
+                let env: QrPollEnvelope =
+                    serde_json::from_str(&body).context("扫码状态响应解析失败")?;
+                // 成功时凭据在 Set-Cookie 里（不是响应体里）。把每条 cookie 的属性
+                // 剥掉后拼起来——`__csrf` 也有用，不能只留 MUSIC_U。
+                // 个别版本的接口会在 body 里再给一份，也认。
+                let from_headers = cookies
+                    .iter()
+                    .map(|c| cookie_pair(c))
+                    .filter(|c| !c.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let cookie = if from_headers.contains("MUSIC_U=") {
+                    Some(from_headers)
+                } else {
+                    env.cookie.clone()
+                }
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty());
+                Ok(QrPoll::new(env.code, env.message, cookie))
+            }
+            ApiMode::Sidecar { .. } => {
+                let url = self.url(
+                    "/login/qr/check",
+                    &format!("key={key}&timestamp={stamp}"),
+                );
+                let body = self.get_text(&url)?;
+                // 自建服务内部出错时会回一个空对象，当作「还没结果」继续轮询，
+                // 而不是把一次瞬时失败当作登录失败。
+                let env: QrPollEnvelope = serde_json::from_str(&body).unwrap_or_default();
+                Ok(QrPoll::new(env.code, env.message, env.cookie))
+            }
+        }
     }
 
     // ---------- 歌词 ----------
@@ -489,6 +714,85 @@ struct UrlEnvelope {
     data: Vec<Option<RawUrlEntry>>,
     #[serde(default, deserialize_with = "flex::as_i32")]
     code: i32,
+}
+
+/// 账号信息。两种模式的包裹层次不一样，都要认：
+///
+/// - 直连：`{code, account:{...}, profile:{...}}`
+/// - 自建服务：`{code, data:{code, account:{...}, profile:{...}}}`
+///
+/// 另外 `profile` 为 `null` 是**正常返回**，表示当前 cookie 不构成登录
+/// （匿名的和失效的 cookie 都长这样），所以这里不能当成错误。
+#[derive(Debug, Default, Deserialize)]
+struct AccountEnvelope {
+    #[serde(default)]
+    profile: Option<RawProfile>,
+    #[serde(default)]
+    data: Option<Box<AccountEnvelope>>,
+}
+
+impl AccountEnvelope {
+    fn pick(self) -> Option<Account> {
+        if let Some(profile) = self.profile {
+            return Some(profile.into_account());
+        }
+        self.data.and_then(|inner| inner.pick())
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawProfile {
+    #[serde(default, rename = "userId", deserialize_with = "flex::as_u64")]
+    user_id: u64,
+    #[serde(default, deserialize_with = "flex::as_string")]
+    nickname: String,
+    #[serde(default, rename = "vipType", deserialize_with = "flex::as_i32")]
+    vip_type: i32,
+}
+
+impl RawProfile {
+    fn into_account(self) -> Account {
+        Account {
+            uid: self.user_id,
+            nickname: if self.nickname.is_empty() {
+                format!("用户 {}", self.user_id)
+            } else {
+                self.nickname
+            },
+            vip_type: self.vip_type,
+        }
+    }
+}
+
+/// 扫码 key。`unikey` 可能出现在顶层，也可能在 `data` 里（自建服务再包一层）。
+#[derive(Debug, Default, Deserialize)]
+struct QrKeyEnvelope {
+    #[serde(default, deserialize_with = "flex::as_string")]
+    unikey: String,
+    #[serde(default)]
+    data: Option<Box<QrKeyEnvelope>>,
+}
+
+impl QrKeyEnvelope {
+    fn pick(self) -> Option<String> {
+        if !self.unikey.is_empty() {
+            return Some(self.unikey);
+        }
+        self.data.and_then(|inner| inner.pick())
+    }
+}
+
+/// 扫码状态。自建服务失败时会回一个空对象，`code` 缺省为 0，
+/// 这时当作「继续轮询」而不是登录失败。
+#[derive(Debug, Default, Deserialize)]
+struct QrPollEnvelope {
+    #[serde(default, deserialize_with = "flex::as_i32")]
+    code: i32,
+    #[serde(default, deserialize_with = "flex::as_string")]
+    message: String,
+    /// 自建服务会把 Set-Cookie 拼成这个字段
+    #[serde(default)]
+    cookie: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
