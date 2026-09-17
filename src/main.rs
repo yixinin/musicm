@@ -3,8 +3,13 @@
 //! 当前里程碑：歌单扫描 + 单曲落地 + FUSE 出口。
 //!
 //! 分层：`netease` 管音源，`store` 管索引，`naming` 管路径命名，
-//! `fetch` 管落地，`vfs` 管虚拟文件树，`fuse_fs` 管把树挂到内核上。
-//! 其中只有 `fuse_fs` 是 Linux 专属的。
+//! `fetch` 管落地，`vfs` 管虚拟文件树，`mount` 管把它交给内核，
+//! `fuse_fs` 是 FUSE 的具体适配。
+//!
+//! `fuse_fs` 是 Linux 专属的，所以它被 `#[cfg]` 挡在非 Linux 构建之外；
+//! 被它牵连的 `mount` 则**在所有平台上都编译**，平台差异留在那个文件内部。
+//! 这个安排是为了让开发机上的 `cargo build` 能编到其中的一半，
+//! 另一半由 `tools/linuxcheck` 对着 aarch64-linux 编（详见 `mount.rs` 的文档）。
 
 mod config;
 mod fetch;
@@ -13,6 +18,9 @@ mod naming;
 mod netease;
 mod store;
 mod tag;
+
+// 挂载这一步的平台分叉都在这里面，所有平台都会编译它（见该文件的模块文档）。
+mod mount;
 
 // 这两个模块只有 Linux 出口（fuse_fs）真正调用，但它们在所有平台上都会被编译：
 // 一来类型错误能立刻在开发机上暴露，二来它们的单元测试本来就该跨平台跑。
@@ -34,6 +42,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use crate::config::{Config, Quality};
 use crate::fetch::Fetcher;
 use crate::model::Playlist;
+use crate::mount::MountArgs;
 use crate::netease::NeteaseClient;
 use crate::store::Index;
 
@@ -120,17 +129,6 @@ enum MountMode {
     Ondemand,
     /// 只列出已经落盘的，不联网
     Cached,
-}
-
-/// 挂载参数。抽出来是因为真正挂载的那一步在平台之间分叉，
-/// 而这些参数两边都要拼。
-struct MountArgs {
-    mountpoint: PathBuf,
-    ondemand: bool,
-    allow_other: bool,
-    /// 只有 Linux 下的 FUSE 事件循环用得到
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    threads: usize,
 }
 
 fn main() -> ExitCode {
@@ -515,64 +513,7 @@ fn cmd_mount(cfg: &Config, args: MountArgs) -> Result<()> {
         Box::new(materialize::OfflineMaterializer)
     };
 
-    mount_now(cfg, args, vfs, materializer)
-}
-
-#[cfg(target_os = "linux")]
-fn mount_now(
-    cfg: &Config,
-    args: MountArgs,
-    vfs: vfs::Vfs,
-    materializer: Box<dyn vfs::Materializer>,
-) -> Result<()> {
-    let mountpoint = args.mountpoint.clone();
-    let req = fuse_fs::MountRequest {
-        mountpoint: mountpoint.clone(),
-        vfs,
-        out_root: cfg.out_root.clone(),
-        materializer,
-        ondemand: args.ondemand,
-        allow_other: args.allow_other,
-        threads: args.threads,
-    };
-
-    match fuse_fs::run(req) {
-        Ok(()) => {
-            println!("已卸载 {mountpoint}");
-            Ok(())
-        }
-        Err(e) if args.allow_other => Err(anyhow!(
-            "{e:#}\n\n\
-             提示：如果错误里出现 allow_other / user_allow_other，说明 /etc/fuse.conf \
-             还没放行。取消 `user_allow_other` 那一行的注释（需要 root）再挂一次；\
-             或者先用 --allow-other=false 验证功能本身是否正常。"
-        )),
-        Err(e) => Err(e),
-    }
-}
-
-/// 非 Linux 平台没有 FUSE。但文件树本身是平台无关的，把它算出来打印一下，
-/// 至少能确认路径生成和曲目识别是否符合预期——这也让这些代码在所有平台上都被编译到。
-#[cfg(not(target_os = "linux"))]
-fn mount_now(
-    _cfg: &Config,
-    args: MountArgs,
-    vfs: vfs::Vfs,
-    _materializer: Box<dyn vfs::Materializer>,
-) -> Result<()> {
-    println!("（当前平台不是 Linux，无法真正挂载，下面是本地算出的文件树骨架）");
-    for source in vfs.children(vfs::ROOT_INO) {
-        println!("  {}/", source.name);
-        for group in vfs.children(source.ino) {
-            println!("    {}/   {} 项", group.name, vfs.children(group.ino).len());
-        }
-    }
-    Err(anyhow!(
-        "FUSE 只在 Linux 上可用，当前是 {}，因此没有挂载 {}。\n\
-         飞牛 fnOS 就是 Debian/Linux：把源码拷过去 `cargo build --release` 即可。",
-        std::env::consts::OS,
-        args.mountpoint.display()
-    ))
+    mount::mount_now(cfg, args, vfs, materializer)
 }
 
 /// 找到这首歌所属的第一张歌单，用来决定它在音乐库里的目录位置。

@@ -45,23 +45,40 @@
   这么切的原因：FUSE 代码在 Windows 开发机上编译不到，能移出平台专属层的逻辑必须移出去。
 - **不要为了 FUSE 去引 libfuse**：`fuser 0.18` 的 `default = []`，不开 `libfuse` 特性时
   Linux 上走 pure-rust 挂载路径，靠 `fusermount3` 完成挂载；NAS 上只需 `apt install fuse3`。
-- 挂载动作按平台分叉，但建树与摘要打印是共享的：`cmd_mount` → `mount_now()`。
+- 挂载动作按平台分叉，但建树与摘要打印是共享的：`cmd_mount` → `mount::mount_now()`。
   非 Linux 平台会把树骨架打印出来再报「FUSE 只在 Linux 上可用」，不是直接编译失败。
+
+## 平台专属代码的位置（踩过坑，别再改回去）
+
+- **反模式：在 `main.rs` 里用 `#[cfg(target_os = "linux")]` 挖掉一块代码。**
+  那样两边都编不到它——Windows 的 `cargo build` 看不到 Linux 那一支，
+  `tools/linuxcheck` 也没引用 `main.rs`。真实后果：`println!("已卸载 {mountpoint}")`
+  （`PathBuf` 没实现 `Display`）在开发机上 21 个测试全绿零警告，NAS 上一编译就炸。
+- **正解：平台专属代码放进「总是被编译的叶子模块」，`#[cfg]` 留在文件内部。**
+  现在承担这个角色的是 `src/mount.rs`：`main.rs` 无条件 `mod mount;`，
+  文件内部再按平台分叉。Windows 构建编非 Linux 那一支，交叉检查编 Linux 那一支，
+  合起来每一行都被真正编译过。
+- 允许留在 `main.rs` 的只有 `#[cfg(target_os = "linux")] mod fuse_fs;` 这种
+  **模块声明**——它门控的是整个文件，而那个文件已经在 `linuxcheck` 列表里。
+- 改动后自查：`Grep "cfg\(target_os"` 看每个门控落在哪个文件，
+  确认那个文件在 `tools/linuxcheck/src/lib.rs` 里。
 - 取回放在 `open()` 而不是 `read()`；`lookup/getattr/readdir` 一律不联网。
 - 两种模式：`--fuse-mode ondemand`（列出全部，首读取回）/ `cached`（只列已落盘，零网络）。
   **给飞牛音乐扫描用 cached**，否则整库扫描 = 全量下载。
 
 ## 验证手段：`tools/linuxcheck`
 
-开发机是 Windows，`fuse_fs.rs` 不在宿主编译图里（改坏了 `cargo build` 都不报错），
-所以每次动 Linux 专属代码后必须跑：
+开发机是 Windows，`fuse_fs.rs` 与 `mount.rs` 的 Linux 分支不在宿主编译图里
+（改坏了 `cargo build` 都不报错），所以每次动 Linux 专属代码后必须跑：
 
 ```
 cd tools/linuxcheck && cargo check --target aarch64-unknown-linux-gnu
 ```
 
-它用 `#[path]` 引用真实源文件，没有副本所以不会过期。原理与坑见技能
-`rust-cross-target-check`。三个命令一起跑才算完：`cargo build` + `cargo test` + 上面这条。
+它用 `#[path]` 引用真实源文件，没有副本所以不会过期。**新增平台专属文件后，
+必须把那个文件也加进 `tools/linuxcheck/src/lib.rs`，否则盲区原样回来。**
+原理、自查清单与「怎么证明检查器没在骗你」见技能 `rust-cross-target-check`。
+三个命令一起跑才算完：`cargo build` + `cargo test` + 上面这条。
 
 ## Milestone status
 
