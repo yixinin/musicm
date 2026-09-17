@@ -16,6 +16,10 @@
 //! 内核拿 inode 做 dentry 缓存，所以 `n_threads > 1` 是必须的：
 //! 同时有多个进程在扫描目录时，单线程事件循环会被一个慢请求（取回音频）
 //! 整个卡住。
+//!
+//! 还有一条：树是挂载那一刻算出来的快照，而文件会在挂载**之后**才出现
+//! （`daily --fetch` 是最典型的例子，它每天都产生新文件），所以 `readdir`
+//! 上挂了一层到期重扫——见 [`MusicFs::maybe_refresh`]。
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -33,6 +37,9 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request, Session, SessionACL,
 };
 
+use crate::config::Quality;
+use crate::mount::RefreshGate;
+use crate::store::Index;
 use crate::vfs::{Materializer, Vfs};
 
 /// 属性缓存时间。
@@ -41,6 +48,12 @@ use crate::vfs::{Materializer, Vfs};
 /// （"还没下载"）也不能缓存太久，否则取回之后内核仍然认为文件不存在。
 const TTL: Duration = Duration::from_secs(1);
 const BLOCK: u32 = 4096;
+
+/// 重扫磁盘的最小间隔（取值与理由见 [`crate::mount::REFRESH_SECS`]）。
+///
+/// 间隔是必须的：重扫要遍历一遍音乐目录，而飞牛音乐扫描时会连发成百上千次
+/// `readdir`。30 秒对内网存储足够快（新文件最多晚这么久出现），也不会让机械盘一直转。
+const REFRESH_INTERVAL: Duration = Duration::from_secs(crate::mount::REFRESH_SECS);
 
 pub struct MountRequest {
     pub mountpoint: PathBuf,
@@ -53,6 +66,9 @@ pub struct MountRequest {
     /// 允许其他用户访问。飞牛音乐以别的用户跑，开这个才扫得到。
     pub allow_other: bool,
     pub threads: usize,
+    /// 重扫时重新读它：挂载期间可能刚扫了新歌单、刚落了新曲目
+    pub index_path: PathBuf,
+    pub quality: Quality,
 }
 
 /// 挂载并进入事件循环，直到被卸载才返回。
@@ -65,6 +81,8 @@ pub fn run(req: MountRequest) -> Result<()> {
         ondemand,
         allow_other,
         threads,
+        index_path,
+        quality,
     } = req;
 
     if !mountpoint.exists() {
@@ -101,7 +119,7 @@ pub fn run(req: MountRequest) -> Result<()> {
     // clone_fd 需要内核 4.5+ 且只在多线程下有意义，收益不大，先不开。
     options.clone_fd = false;
 
-    let fs = MusicFs::new(vfs, out_root, materializer, ondemand);
+    let fs = MusicFs::new(vfs, out_root, materializer, ondemand, index_path, quality);
     let session = Session::new(fs, &mountpoint, &options)
         .with_context(|| format!("挂载到 {} 失败", mountpoint.display()))?;
 
@@ -119,10 +137,22 @@ struct MusicFs {
     next_fh: AtomicU64,
     uid: u32,
     gid: u32,
+    /// 重扫要用（见 [`MusicFs::maybe_refresh`]）
+    index_path: PathBuf,
+    quality: Quality,
+    /// 「到期才重扫」的闸门（语义与测试都在 `mount.rs`：那边两个平台都编译）
+    refresh: RefreshGate,
 }
 
 impl MusicFs {
-    fn new(vfs: Vfs, out_root: PathBuf, materializer: Box<dyn Materializer>, ondemand: bool) -> Self {
+    fn new(
+        vfs: Vfs,
+        out_root: PathBuf,
+        materializer: Box<dyn Materializer>,
+        ondemand: bool,
+        index_path: PathBuf,
+        quality: Quality,
+    ) -> Self {
         MusicFs {
             vfs: Mutex::new(vfs),
             out_root,
@@ -132,6 +162,43 @@ impl MusicFs {
             next_fh: AtomicU64::new(1),
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
+            index_path,
+            quality,
+            refresh: RefreshGate::new(REFRESH_INTERVAL),
+        }
+    }
+
+    /// 到期就在原树上增量重扫一次磁盘（索引也重新读）。
+    ///
+    /// 挂在这里而不是开一个后台线程：只有真的有人读目录时才需要新的文件，
+    /// 而且重扫用的是同一把锁，放在 `readdir` 里天然不会和它自己的遍历打架。
+    ///
+    /// 重扫失败一律只跳过这一轮——一个只读文件系统不该因为索引的瞬时写坏
+    /// 就把 `readdir` 变成 EIO。
+    fn maybe_refresh(&self) {
+        if !self.refresh.due() {
+            return;
+        }
+
+        let index = match Index::load(&self.index_path) {
+            Ok(index) => index,
+            Err(e) => {
+                eprintln!("[musicm] 重扫跳过：索引读取失败 {e:#}");
+                return;
+            }
+        };
+
+        let Ok(mut vfs) = self.vfs.lock() else {
+            return;
+        };
+        let stats = vfs.refresh(&self.out_root, &index, self.quality, self.ondemand);
+        drop(vfs);
+
+        if stats.added > 0 || stats.materialized > 0 {
+            eprintln!(
+                "[musicm] 重扫磁盘：新增 {} 个文件 / {} 个转为已落地",
+                stats.added, stats.materialized
+            );
         }
     }
 
@@ -237,6 +304,10 @@ impl fuser::Filesystem for MusicFs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        // 树是挂载那一刻的快照，而文件会在之后才落地（每日推荐每天都变）。
+        // 有人来读目录时顺便看一眼要不要重扫——读到的就是新内容，不需要重新挂载。
+        self.maybe_refresh();
+
         let Ok(vfs) = self.vfs.lock() else {
             reply.error(Errno::EIO);
             return;

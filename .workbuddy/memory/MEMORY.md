@@ -2,264 +2,228 @@
 
 Turns Netease/QQ Music playlists into a local music library that 飞牛音乐 (fnOS's
 native music app) can scan and play.
-
-(Memory files are written in English per a standing user request, even though the
-CLI output and UI are Chinese.)
+(Memory files are in English per a standing user request, even though the CLI and UI are Chinese.)
 
 ## Hard constraints
 
-- **Target runtime is 飞牛 fnOS (Debian) / aarch64.** Every dependency choice
-  follows from this.
-  - No `rusqlite` bundled, no `native-tls`/OpenSSL — installing a C toolchain on
-    the NAS is painful. Use `ureq` + rustls, `lofty` (pure Rust). `ring` is the
-    only dep needing gcc.
-  - Build directly on the NAS with `cargo build --release`; don't cross-compile.
+- **Target runtime is 飞牛 fnOS (Debian) / aarch64**; every dependency choice follows.
+  - No bundled `rusqlite`, no `native-tls`/OpenSSL (a C toolchain on the NAS is painful).
+    Use `ureq` + rustls, `lofty` (pure Rust). `ring` is the only dep needing gcc.
+  - Build on the NAS with `cargo build --release`; don't cross-compile.
 - Dev machine is Windows x86_64; keep code portable (no platform-specific APIs).
-- Data dir defaults to `$HOME/.musicm` (`config.json` + `index.json`); music lands
-  in `<data_dir>/library`, overridable with `--out`. Use ASCII paths in deployment.
+- Data dir `$HOME/.musicm` (`config.json` + `index.json`); music lands in
+  `<data_dir>/library`, overridable with `--out`. Use ASCII paths in deployment.
 
 ## Architecture decisions (do not silently revert)
 
-- Index is **JSON** (atomic write: temp file + rename), not SQLite. Move to `redb`
-  at ~100k tracks.
-- **Scanning and playback are strictly separated**: scanning/listing reads only the
-  index and makes zero network calls; only actually fetching audio hits the API.
-  This is what keeps thousands of tracks from timing out.
-- **Metadata must be embedded.** fnOS's own FAQ states cover/lyric matching fails
-  without it. Download flow is fixed: temp file (keeping the audio extension) →
-  tag → atomic rename. Failures never leave half-finished files in the library.
+- Index is **JSON** (atomic write: temp file + rename), not SQLite. Move to `redb` at ~100k tracks.
+- **Scanning and playback are strictly separated**: scanning/listing reads only the index and
+  makes zero network calls; only fetching audio hits the API. That's what keeps thousands of
+  tracks from timing out.
+- **Metadata must be embedded** (fnOS's FAQ: cover/lyric matching fails without it). Download
+  flow is fixed: temp file (keeping the audio extension) → tag → atomic rename; failures never
+  leave half-finished files in the library.
 - ID3 written as **2.3** (`WriteOptions::use_id3v23(true)`).
 - Lyrics written twice: timestamped `.lrc` + stripped plain text into USLT.
-- Quality ladder: `母带 → hires → 无损 → 极高 → 标准`, tried in descending order.
-  The server may "return 320k mp3 when asked for lossless", so **requested level
-  and actual level are recorded separately** (`AudioInfo::quality` vs
-  `AudioInfo::actual_level`).
-- Netease response field types are unstable (see the `netease-music-api` skill):
-  **all** raw fields must use the lenient `flex::*` deserializers in `netease.rs`,
-  never bare `#[derive(Deserialize)]` fields.
+- Quality ladder `母带 → hires → 无损 → 极高 → 标准`, descending. The server may return 320k mp3
+  when asked for lossless, so **requested and actual level are recorded separately**
+  (`AudioInfo::quality` vs `AudioInfo::actual_level`).
+- Netease field types are unstable (skill `netease-music-api`): **all** raw fields use the
+  lenient `flex::*` deserializers, never bare `#[derive(Deserialize)]`.
+- **Empty-vs-missing field rule — applies to every list API**: an empty array and an absent
+  field must stay distinguishable; never print a bare "0 条".
+  - `DailyShape`: field present but empty = not logged in; field absent = API changed.
+  - `ListShape` (search / account playlists): on no match the array vanishes entirely
+    (`{"result":{"playlistCount":0}}`); rule is "array absent **and** count absent" = changed.
+    Read the count with `flex::as_opt_u64` — `#[serde(default)]` collapses 0 and absent and
+    destroys the evidence. The self-reported total (`songCount=336`) is usually far larger than
+    the page size; display uses it.
+  - Helpers: `as_opt_u64`, `as_opt_bool` (`null` = unknown ≠ `false`; `/user/playlist`'s
+    `subscribed` is null when anonymous), `MaybeList::is_present/into_vec`.
 
-## Single source of truth for paths (don't bypass it)
+## Paths: one source of truth
 
-- **Virtual tree paths == on-disk paths.** Both must come from the same functions:
-  `naming::group_rel(source, playlist_name)` for directories,
-  `naming::unique_stems(tracks)` for filename stems. If either side builds its own
-  paths, the cache never hits.
-- Hence `fetch.rs`'s real entry point is `ensure_stem(track, dir, stem, force)` —
-  caller (index or virtual tree) supplies dir + stem; `Fetcher::fetch()` is a
-  convenience wrapper.
-- **Duplicate names inside a playlist must be deduped** (`unique_stems` appends
-  ` (2)`): when FUSE's `readdir` emits duplicate entries, the kernel dentry cache
-  keeps only one.
-- Track file **extension follows the container actually written**. Before landing
-  it's guessed from the level (`Quality::expected_ext`); on mismatch `Vfs::adopt`
-  renames and re-registers the inode.
-- `naming::landed_stems(dir)` = which stems are already on disk (skips `.part`
-  shards). Lives in `naming.rs` because both CLI and Web need it; two copies would
-  drift and disagree about "downloaded".
-- `naming::DAILY_GROUP` ("每日推荐") is the daily-recommendation directory name,
-  shared by CLI and Web for the same reason.
+- **Virtual tree paths == on-disk paths.** Both come from the same functions:
+  `naming::group_rel(source, playlist_name)` for dirs, `naming::unique_stems(tracks)` for stems.
+  Anything that builds its own paths means the cache never hits.
+- So `fetch.rs`'s real entry point is `ensure_stem(track, dir, stem, force)` — the caller (index
+  or virtual tree) supplies dir + stem; `Fetcher::fetch()` is a convenience wrapper.
+- **Duplicate names inside a playlist must be deduped** (`unique_stems` appends ` (2)`): when
+  FUSE's `readdir` emits duplicate entries the kernel dentry cache keeps only one.
+- **The extension follows the container actually written**: guessed from the level before landing
+  (`Quality::expected_ext`); on mismatch `Vfs::adopt` renames and re-registers the inode.
+- `naming::landed_stems(dir)` = stems already on disk (skips `.part` shards); lives in `naming.rs`
+  because CLI and Web both need it. `naming::DAILY_GROUP` ("每日推荐") likewise.
+- **One landing helper for every entry point**: `search` / `artist` / `daily` / `play` share
+  `fetch_many(tracks, group, count, label)` — dir from `group_rel` (`None` → `<音源>/单曲`;
+  daily passes `Some(DAILY_GROUP)`), stems from `unique_stems`, and it checks `index.file_of`
+  first to skip already-landed tracks. Hand-built paths store the same song in two directories.
+- Search results **must not be landed directly**: the search API's `album` has only `picId`, no
+  `picUrl` (verified), so call `songs_detail(&ids)` first or the cover is lost — and fnOS
+  scraping depends on it.
 
 ## Platform-specific code placement (learned the hard way)
 
-- **Anti-pattern: carving out a block in `main.rs` with
-  `#[cfg(target_os = "linux")]`.** Neither side compiles it — Windows
-  `cargo build` can't see the Linux branch, and `tools/linuxcheck` doesn't
-  reference `main.rs`. Real consequence: `println!("已卸载 {mountpoint}")`
-  (`PathBuf` has no `Display`) passed 21 green tests with zero warnings on the dev
-  machine, then blew up on the NAS.
-- **Correct: put platform-specific code in a "leaf module that is always
-  compiled", with `#[cfg]` inside the file.** `src/mount.rs` plays that role:
-  `main.rs` declares `mod mount;` unconditionally, the file forks internally.
-  Windows builds the non-Linux branch, the cross-check builds the Linux one, so
-  every line gets really compiled.
+- **Anti-pattern: a `#[cfg(target_os = "linux")]` block inside `main.rs`** — neither side compiles
+  it (Windows `cargo build` skips it; `linuxcheck` doesn't reference `main.rs`). Real cost:
+  `println!("已卸载 {mountpoint}")` (`PathBuf` has no `Display`) passed 21 green tests with zero
+  warnings on the dev machine, then blew up on the NAS.
+- **Correct: platform-specific code in a "leaf module that is always compiled", forking with
+  `#[cfg]` inside the file.** `src/mount.rs` plays that role; `main.rs` declares `mod mount;`
+  unconditionally.
 - The only `#[cfg]` allowed in `main.rs` is a **module declaration** like
-  `#[cfg(target_os = "linux")] mod fuse_fs;` — it gates a whole file, and that file
-  is already in the `linuxcheck` list.
-- After changing things, self-check: `Grep "cfg\(target_os"` and confirm each gated
-  item lives in a file listed in `tools/linuxcheck/src/lib.rs`.
+  `#[cfg(target_os = "linux")] mod fuse_fs;` — it gates a whole file that is already in the
+  `linuxcheck` list.
+- Self-check after changes: `Grep "cfg\(target_os"` and confirm each gated item lives in a file
+  listed in `tools/linuxcheck/src/lib.rs`.
 
-## FUSE export (M4a, done)
+## FUSE export
 
-- `vfs.rs` = platform-independent tree core (unit-testable everywhere);
-  `fuse_fs.rs` = thin Linux adapter.
-- **Don't pull in libfuse for FUSE**: `fuser 0.18` with `default-features = false`
-  takes a pure-Rust mount path on Linux via `fusermount3`; the NAS only needs
-  `apt install fuse3`.
-- Fetch happens in `open()`, not `read()`; `lookup`/`getattr`/`readdir` never touch
-  the network.
-- Two modes: `--fuse-mode ondemand` (list everything, fetch on first read) /
-  `cached` (list only what's landed, zero network). **Use cached for 飞牛 scanning**,
-  otherwise scanning the whole library = downloading everything.
-- `mount.rs` also owns the control surface the Web UI needs, all platform-forked
-  inside that file: `fuse_supported()` (a `const fn` returning a runtime bool so the
-  UI can grey out the button), `unmount()` (shells out to `fusermount3`/`fusermount`
-  -u), `mounted_fstype()` (reads `/proc/mounts`, since after a restart the in-memory
-  "mounted" flag is gone but the kernel mount is not).
+- `vfs.rs` = platform-independent tree core (unit-testable everywhere); `fuse_fs.rs` = thin Linux
+  adapter.
+- **No libfuse**: `fuser 0.18` with `default-features = false` gives a pure-Rust mount path via
+  `fusermount3`; the NAS only needs `apt install fuse3`.
+- Fetch happens in `open()`, never in `read()`; `lookup`/`getattr`/`readdir` never touch the network.
+- Two modes: `--fuse-mode ondemand` (list everything, fetch on first read) / `cached` (list only
+  what's landed, zero network). **Use cached for 飞牛扫描**, otherwise a full scan = downloading
+  the whole library.
+- **The tree is built at mount time, then incrementally refreshed.** `Vfs::build` runs once; after
+  that `Vfs::refresh` merges "index ∪ disk" into the live tree, gated by `RefreshGate`
+  (`mount.rs`, so both platforms compile and test it) and hooked on FUSE `readdir` — 30 s
+  (`mount::REFRESH_SECS`, shared with the CLI hint so the two can't drift). This is what makes
+  `daily --fetch` after mounting visible without a remount.
+  - **Never rebuild the tree, only merge.** Inodes must stay put (kernel dentry cache). Merge reuses
+    `by_rel`; only new paths get new numbers.
+  - **Additive only, never delete.** Removing "not found on disk" nodes races with `Vfs::adopt`: the
+    fetch flow is "placeholder with guessed ext → land → adopt renames", and during that window the
+    guessed path legitimately doesn't exist. Cost: manually deleted files linger until remount.
+  - `RefreshStats` counts *new file nodes* and *pending→materialised upgrades* separately; counting
+    the latter as "materialised nodes went up" would count freshly landed files as upgrades and
+    make the log lie.
+- Files land on disk and the tree is built from a disk scan, so **a landed directory that belongs
+  to no playlist still shows up in both modes** (verified with 每日推荐).
+- `--allow-other` is needed when 飞牛音乐 runs as a different user (`/etc/fuse.conf` must
+  uncomment `user_allow_other`).
+- `mount.rs` also owns the Web UI's control surface, platform-forked inside that file:
+  `fuse_supported()` (`const fn` returning a runtime bool so the UI can grey out the button),
+  `unmount()` (shells out to `fusermount3`/`fusermount -u`), `mounted_fstype()` (reads
+  `/proc/mounts`, since the in-memory "mounted" flag is lost on restart).
+- `cmd_mount`'s guard is **"is there anything in the tree", not "is the index non-empty"**. It once
+  required `index.tracks > 0` ("you probably forgot to scan"), which rejected the legitimate case of
+  a library holding only daily/search/single-track landings — none of which are indexed by design.
+  Now: error only when tree and index are *both* empty; index-empty prints "this is pure disk
+  content"; index-non-empty + cached + empty tree prints "nothing landed yet". All four cases
+  smoke-tested.
 
 ## Verification: `tools/linuxcheck`
 
-The dev machine is Windows, so `fuse_fs.rs` and the Linux branch of `mount.rs` are
-not in the host compile graph. After touching Linux-only code, run:
+- The dev machine is Windows, so `fuse_fs.rs` and the Linux branch of `mount.rs` are not in the
+  host compile graph. Run `cd tools/linuxcheck && cargo check --target aarch64-unknown-linux-gnu`.
+- It `#[path]`-includes the **real** source files, so it can never go stale. **After adding a
+  platform-specific file, add it to `tools/linuxcheck/src/lib.rs`**, or the blind spot returns.
+  "Done" = `cargo build` + `cargo test` + the line above.
+- **Must run inside `tools/linuxcheck/`, never the repo root**: the root crate depends on `ring`,
+  so `cargo check --target aarch64-…` there looks for `aarch64-linux-gnu-gcc` and fails with
+  `failed to run custom build command for ring` — wrong directory, not bad code.
+- Currently checked: `model` `auth` `qr` `config` `naming` `store` `vfs` `fuse_fs` `mount`.
+  `auth.rs`'s `write_private`/`harden` are `#[cfg(unix)]` — only the cross check compiles them, so
+  run it after touching credential persistence.
+- Gotchas: **warnings replay from the incremental cache** (`cargo clean -p linuxcheck` to confirm;
+  on a cache hit nothing prints, so "fast and silent" ≠ clean). **`cargo test` does not produce
+  `target/debug/musicm.exe`** — run `cargo build` before CLI smoke tests. PowerShell's
+  `& exe args *> file` writes **UTF-16LE**; transcode before reading.
 
-```
-cd tools/linuxcheck && cargo check --target aarch64-unknown-linux-gnu
-```
+## Web admin UI (`serve`)
 
-It `#[path]`-includes the **real** source files, so it can never go stale. **After
-adding a platform-specific file, add it to `tools/linuxcheck/src/lib.rs` too**, or
-the blind spot returns. The three commands that count as "done": `cargo build` +
-`cargo test` + the line above.
+- `musicm serve [--listen 127.0.0.1:8765] [--token T] [--no-auth]`: everything the CLI can do over
+  HTTP (search, login, scan, download, mount, jobs).
+- **Hand-written HTTP server on `std::net`, zero new dependencies** (`axum` drags in
+  tokio/hyper/tower; `tiny_http` saves little). Documented simplifications: `Connection: close`
+  only, `Content-Length` bodies only, no HTTPS (reverse proxy in front).
+- Front end `src/web/{index.html,app.css,app.js}` embedded with `include_str!` so the NAS binary is
+  self-contained; no CDN, no framework.
+- **Auth: a non-loopback listen requires a token.** Omitted → one is generated and printed as a
+  ready-to-click URL; `--no-auth` opts out with a warning. Token is checked on `/api/*` only so
+  static assets load first.
+- **`src/web.rs` must NOT be added to `linuxcheck`** — it depends on `netease`/`fetch`
+  (→ `ureq`/`ring`), and linuxcheck deliberately keeps only pure-Rust deps. It is
+  platform-independent, so host `cargo build` covers it — which is exactly why all platform bits
+  live in `mount.rs`.
+- Long operations (scan / download) run as **background jobs** with an append-only log the UI polls
+  (`/api/jobs`, `/api/jobs/:id`): a 200-track download can't block an HTTP request. Each job
+  re-loads `Config`/`Index` itself rather than sharing mutable state (`Index` isn't `Clone`; a
+  long-held lock would block every other request). `Shared` also re-`Config::load`s per request,
+  so hand-edited `config.json` is picked up immediately.
+- `/api/play` writes back to the index (same path as `musicm play`, incl. `remember_track`);
+  `/api/fetch` deliberately does not (matches `daily --fetch`).
 
-**Must be run inside `tools/linuxcheck/`, never the repo root.** The root
-`musicm` crate depends on `ring`, so `cargo check --target aarch64-…` there goes
-looking for `aarch64-linux-gnu-gcc` and fails with
-`failed to run custom build command for ring` — that means wrong directory, not bad
-code. `linuxcheck` deliberately keeps only pure-Rust deps.
+## Credentials & login
 
-Currently checked: `model` `auth` `qr` `config` `naming` `store` `vfs` `fuse_fs`
-`mount`. `auth.rs`'s `write_private`/`harden` are `#[cfg(unix)]` — **only the cross
-check compiles them**, so run it after touching credential persistence; the host
-`cargo build` knows nothing about that branch.
-
-Two gotchas:
-
-- **Warnings replay from the incremental cache.** Seeing warnings on code you
-  didn't touch: `cargo clean -p linuxcheck` and re-run; if they vanish it was a
-  stale diagnostic (seen with `mount.rs`'s `unused import: Path`). Conversely, on a
-  cache hit **nothing is printed**, so "fast and silent" is not proof of clean.
-- **`cargo test` does not produce `target/debug/musicm.exe`.** Run `cargo build`
-  before CLI smoke tests or you're testing the previous binary (symptoms look like
-  "unrecognized subcommand"). Also, PowerShell's `& exe args *> file` writes
-  **UTF-16LE** — transcode before reading.
-
-## Web admin UI (`serve`, M7) — implemented 2026-09-17
-
-- `musicm serve [--listen 127.0.0.1:8765] [--token T] [--no-auth]`. Everything the
-  CLI can do is exposed over HTTP: search, login, scan, download, mount, jobs.
-- **HTTP server is hand-written on `std::net` — zero new dependencies.** `axum`
-  would drag in tokio/hyper/tower (expensive first build on aarch64); `tiny_http`
-  is light but 200 lines of `std` buys the same thing given we only serve our own
-  front end. Deliberate simplifications, each documented at the implementation:
-  `Connection: close` only, `Content-Length` bodies only (no chunked), no HTTPS
-  (put a reverse proxy in front).
-- Front end is `src/web/{index.html,app.css,app.js}`, embedded with `include_str!`
-  so the NAS binary is self-contained (no missing-asset white screens). No CDN, no
-  framework, vanilla JS.
-- **Auth rule: non-loopback listen requires a token.** Omitted → one is generated
-  and printed as a ready-to-click URL; `--no-auth` opts out with a warning. The UI
-  can change credentials and write to the music library, so an unauthenticated LAN
-  port is not acceptable. Token is checked on `/api/*` only — static assets must
-  load first so the user can even type a token.
-- **`src/web.rs` must NOT be added to `linuxcheck`.** It depends on
-  `netease`/`fetch` (→ `ureq`/`ring`), and `linuxcheck` deliberately keeps only
-  pure-Rust deps. It's platform-independent, so host `cargo build` covers it — which
-  is exactly why all platform-specific bits live in `mount.rs` instead.
-- Long operations (scan / download) run as **background jobs** with an append-only
-  log the UI polls (`/api/jobs`, `/api/jobs/:id`), because a 200-track download
-  can't block an HTTP request. Each job reloads `Config`/`Index` itself rather than
-  sharing mutable state — `Index` isn't `Clone` and a long-held lock would block
-  every other request. Same reason `Shared` re-`Config::load`s per request: it picks
-  up hand-edited `config.json` immediately.
-- `/api/play` writes back to the index (same path as `musicm play`, incl.
-  `remember_track` for tracks not yet indexed); `/api/fetch` deliberately does not
-  (matches `daily --fetch`, so daily shoves don't pollute the index).
-
-## Credentials & login (M5a)
-
-- ⚠️ **QR login is blocked by Netease risk control; never make it the main path.**
-  After a successful scan it returns `code=8821` ("行为验证码"). It arrives *after*
-  the scan succeeds, so it looks like slowness — it can never succeed; re-scanning
-  or changing `type` doesn't help. See `netease-music-api` skill §9.
-- **Pasting a cookie is the reliable path**: `login --cookie '<str>'` /
-  `--cookie-file <path>` / stdin. The value must contain `MUSIC_U` (only `MUSIC_A`
-  is not a login).
-- **`8821` must be terminal.** It once shared `QrState::Unknown` with "sidecar
-  returned `{}`", so users polished away 5 minutes before erroring. Now three
-  states: `Empty` (no code, keep polling) / `Blocked` (8821, stop now) /
-  `Unrecognized` (print raw code+message, keep polling), arbitrated by
-  `QrState::is_terminal()`, with a `debug_assert!` invariant in the poll loop.
-- Cookie lives **only in `<data_dir>/cookie.txt`**, mode 600 on Unix, never written
-  back to `config.json`. That's why `Config::cookie` uses
-  `#[serde(default, skip_serializing)]` — **not**
-  `skip_serializing_if = "Option::is_none"` (that only skips `None`, so plaintext
-  still lands on disk; learned the hard way).
-- Report where credentials came from (`auth::Origin`: env / file / migrated) so
-  users know what to clear when they expire.
-- `--cookie` belongs to `login` only — no global same-named flag (it once wrote
-  twice per invocation).
-- Accept three paste shapes: bare `MUSIC_U=...`, labelled `Cookie: MUSIC_U=...`
-  (DevTools header line), a whole "copy as cURL". **The label is only recognised at
-  the start** — a legitimate value containing `cookie:` (`MUSIC_U=abc; note=cookie:x`)
-  must not be truncated; two tests guard each other.
-- ⚠️ `ureq` reads `HTTP_PROXY`/`ALL_PROXY`. **Running through a proxy easily trips
-  risk control** (datacenter egress IP) and also breaks `127.0.0.1` test servers
-  with `CONNECT proxy failed` — for local smoke tests, clear the proxy env vars.
+- ⚠️ **QR login is blocked by Netease risk control; never make it the main path.** After a
+  successful scan it returns `code=8821` ("行为验证码"). It arrives *after* the scan succeeds, so
+  it looks like slowness; it can never succeed and re-scanning or changing `type` doesn't help
+  (skill §9).
+- **Pasting a cookie is the reliable path**: `login --cookie '<串>'` / `--cookie-file <路径>` /
+  stdin. The value must contain `MUSIC_U` (`MUSIC_A` alone is not a login).
+- **`8821` must be terminal.** It once shared `QrState::Unknown` with "sidecar returned `{}`", so
+  users polished a dead QR for 5 minutes. Three states now: `Empty` (no code, keep polling) /
+  `Blocked` (8821, stop now) / `Unrecognized` (print raw code+message, keep polling), arbitrated
+  by `QrState::is_terminal()` with a `debug_assert!` invariant in the poll loop.
+- Cookie lives **only in `<data_dir>/cookie.txt`**, mode 600 on Unix, never written back to
+  `config.json`. That's why `Config::cookie` uses `#[serde(default, skip_serializing)]` — **not**
+  `skip_serializing_if = "Option::is_none"` (that only skips `None`, so plaintext still lands on
+  disk).
+- Report where credentials came from (`auth::Origin`: env / file / migrated) so users know what to
+  clear when they expire.
+- `--cookie` belongs to `login` only — no global same-named flag (it once wrote twice per
+  invocation).
+- Accept three paste shapes: bare `MUSIC_U=…`, labelled `Cookie: MUSIC_U=…` (DevTools header line),
+  a whole "copy as cURL". **The label is recognised only at the start** — a legitimate value
+  containing `cookie:` (`MUSIC_U=abc; note=cookie:x`) must not be truncated; two tests guard each
+  other.
+- ⚠️ `ureq` reads `HTTP_PROXY`/`ALL_PROXY`. **Running through a proxy easily trips risk control**
+  (datacenter egress IP) and breaks `127.0.0.1` test servers with `CONNECT proxy failed` — clear
+  the proxy env vars for local smoke tests.
 
 ## Daily recommendations (`daily`)
 
-- ⚠️ **This API fails as a silent empty array**: both "not logged in" and "cookie
-  expired" return `code=200` + `recommend: []` with **no error code** (like
-  `account`'s `profile:null`). So `netease.rs` uses a three-state `flex::MaybeList`
-  (Missing / Empty / Items) to separate "field absent = API changed" from "field
-  present but empty = not logged in" — collapsing to a `Vec` makes it
-  unexplainable. The CLI then picks wording based on whether a cookie exists locally.
-- **Both response shapes must parse**: plain `/api/` gives `{code, recommend:[...]}`,
-  weapi/newer sidecars give `{code, data:{dailySongs:[...]}}`; App-style fields
-  `ar`/`al`/`dt` are recognised via `#[serde(alias)]` on `RawTrack`. Sidecar path is
-  `/recommend/songs` (not `/v1/discovery/...`) and needs `timestamp=` to break cache.
-- **Deliberately not indexed**: daily changes every day; making it a playlist would
-  pile one-off tracks into the index. `--fetch N` only writes files to
-  `网易云/每日推荐/`. "Already landed" = check the index, then the directory's stems.
-- Tell users the cost honestly: these files don't show in `musicm info` stats, and
-  `play <id>` won't recognise the landed copy (it fetches a new one into
-  `网易云/单曲/`). FUSE can see them from disk, but they belong to no playlist.
+- ⚠️ **This API fails as a silent empty array**: both "not logged in" and "cookie expired" return
+  `code=200` + `recommend: []` with **no error code** (same trap as `account`'s `profile:null`).
+  `netease.rs` uses a three-state `flex::MaybeList` (Missing / Empty / Items) so "field absent =
+  API changed" is separable from "present but empty = not logged in"; the CLI picks its wording
+  from whether a cookie exists locally.
+- **Both response shapes must parse**: plain `/api/` gives `{code, recommend:[…]}`,
+  weapi/newer sidecars give `{code, data:{dailySongs:[…]}}`; App-style `ar`/`al`/`dt` are
+  recognised via `#[serde(alias)]` on `RawTrack`. Sidecar path is `/recommend/songs` (not
+  `/v1/discovery/…`) and needs `timestamp=` to break cache.
+- **Deliberately not indexed**: daily changes every day and would pile one-off tracks into the
+  index. `--fetch N` only writes files to `<out>/网易云/每日推荐/`. "Already landed" = check the
+  index, then the directory's stems.
+- Consequences to state plainly: these files don't appear in `musicm info` stats, and
+  `play <id>` won't reuse the landed copy (it fetches a new one into `网易云/单曲/`).
+- **Mounting them** (verified on a mock library): the tree is built from a disk scan of `<out>`, so
+  a landed `每日推荐` directory shows up in **both** modes, but daily is never in `plan()`, so
+  ondemand mode gives it **no placeholder** — it must be landed first (`daily --fetch N`), and
+  there is no fetch-on-read path for it. Since 2026-09-17 the mount also refreshes itself (see the
+  FUSE section), so a `daily --fetch` after mounting appears within 30 s without a remount.
+- Working recipe: `scan <歌单id>` once (or skip it — the guard now allows a daily-only library),
+  `daily --fetch N`, then `mount <挂载点> --fuse-mode cached --allow-other`; or point `--out` at
+  the fnOS media folder and skip FUSE entirely, since daily files are ordinary tagged files.
 
 ## Search / account playlists / artists
 
-- API details and three response-shape traps live in the `netease-music-api` skill
-  §11 — read it before touching these commands.
-- The `--type` → numeric type mapping (1 / 1000 / 100) **fails silently, you just
-  never find anything**, so the `search_type_maps_to_the_api_kinds` test is a rivet.
-  Don't delete it.
-- `/user/playlist`'s `playlist` is **top-level** (not under `result`); `more` means
-  another page; anonymous sees only public playlists. `artist/top/song`'s `song` is
-  top-level and **`limit` does not work** (fixed 50) — truncate yourself.
-- Keywords must be percent-encoded (`encode_query`, hand-rolled, no dep): Chinese,
-  spaces, `&`, `#` all occur and raw concatenation shreds the query string.
-- The three result kinds lead to different next actions (songs can land /
-  playlists need scan / artists need another query), so print them in three blocks
-  with the next command at the end of each; mark 已索引 / 已落地 from the index.
-
-## "Empty results must be explainable" — one consistent rule
-
-List-shaped APIs keep tripping the same trap, so the rule is fixed: **empty array
-vs missing field must be distinguished.**
-
-- `DailyShape`: field present but empty = not logged in; field absent = API changed.
-- `ListShape` (search / account playlists): **on no match the array field vanishes
-  entirely**, leaving `{"result":{"playlistCount":0}}`. The rule is "array absent
-  **and** count field absent" = changed; read the count with `flex::as_opt_u64`
-  (`#[serde(default)]` would collapse 0 and absent, destroying the evidence). The
-  self-reported total (`songCount=336`) is usually far larger than the page size —
-  display uses it.
-- Copy this pattern for new list APIs; never just print "0 条".
-
-Supporting `flex` helpers: `as_opt_u64` (0 vs absent), `as_opt_bool` (`null` =
-unknown, distinct from `false` — `/user/playlist`'s `subscribed` is `null` when
-anonymous), `MaybeList::is_present/into_vec`.
-
-## One rule for landing paths, many entry points
-
-`search` / `artist` / `daily` / `play` all produce tracks that belong to no
-playlist; they share `fetch_many(tracks, group, count, label)`: directory from
-`naming::group_rel` (`None` → `<音源>/单曲`; daily passes `Some("每日推荐")`), stem
-from `naming::unique_stems`. **New entry points must reuse it** — hand-built paths
-store the same song in two directories. It also checks `index.file_of` first to
-skip already-landed tracks.
-
-Search results **must not be landed directly**: the search API's `album` has only
-`picId`, no `picUrl` (verified), so call `songs_detail(&ids)` first or the cover is
-lost — and fnOS scraping depends on it.
+- API details and three response-shape traps live in the `netease-music-api` skill §11 — read it
+  before touching these commands.
+- The `--type` → numeric type mapping (1 / 1000 / 100) **fails silently, you just never find
+  anything**, so the `search_type_maps_to_the_api_kinds` test is a rivet.
+- `/user/playlist`'s `playlist` is **top-level** (not under `result`); `more` means another page;
+  anonymous sees only public playlists. `artist/top/song`'s `song` is top-level and **`limit` does
+  not work** (fixed 50) — truncate yourself.
+- Keywords must be percent-encoded (`encode_query`, hand-rolled, no dep): Chinese, spaces, `&`,
+  `#` all occur and raw concatenation shreds the query string.
+- The three result kinds lead to different next actions (songs can land / playlists need scan /
+  artists need another query), so print three blocks with the next command at the end of each;
+  mark 已索引 / 已落地 from the index.
 
 ## CLI surface
 
@@ -270,16 +234,14 @@ lost — and fnOS scraping depends on it.
 `mount <挂载点> [--fuse-mode ondemand|cached] [--allow-other] [--threads N]` ·
 `login [--qr] [--cookie <串> | --cookie-file <路径>]` · `logout` · `whoami` · `info` ·
 `serve [--listen ADDR] [--token T] [--no-auth]`
-Global flags `--data-dir / --out / --quality`; **given ones are written to config
-and reused**.
+Global flags `--data-dir / --out / --quality`; **given ones are written to config and reused**.
 
-- `playlists` reads the index by default; `--remote` lists the account's playlists
-  (self by default, needs login; `--uid` allows anonymous lookup of someone else's
-  public playlists, but say that private ones are invisible).
-- `play <id>` **accepts bare numeric ids not in the index** (fetches metadata via
-  `songs_detail` on the spot), which is what makes ids from `search`/`artist` useful.
-- `whoami` really hits the account API (distinguishes "no login" from "login
-  expired"), so it fails offline — deliberately; it's a probe.
+- `playlists` reads the index by default; `--remote` lists the account's playlists (self by
+  default, needs login; `--uid` allows anonymous lookup of someone else's public ones).
+- `play <id>` **accepts bare numeric ids not in the index** (fetches metadata via `songs_detail`
+  on the spot), which is what makes ids from `search`/`artist` useful.
+- `whoami` really hits the account API (distinguishes "no login" from "login expired"), so it
+  fails offline — deliberately; it's a probe.
 
 ## Milestone status
 
@@ -288,8 +250,9 @@ and reused**.
 - ✅ M2 single-track landing (resolve → download → tag → lyrics/cover)
 - ✅ M4a FUSE export (read-only, on-demand, tree verified with real data)
 - ✅ M5a credentials: QR + credential file + Direct/Sidecar modes
-- ✅ M7 Web admin UI (`serve`: search / login / scan / download / mount)
-- ⬜ M3 cache quota & prefetch queue (ondemand FUXE experience depends on it)
+- ✅ M7 Web admin UI (`serve`)
+- ✅ `daily` standalone command (list + `--fetch`, deliberately unindexed)
+- ⬜ M3 cache quota & prefetch queue (ondemand FUSE experience depends on it)
 - ⬜ M4b WebDAV export (fnOS remote mount, no root needed — higher priority)
 - ⬜ M5b real lossless/master landing (login works; VIP resolve rate unverified)
 - ⬜ M6 QQ Music source + cross-source dedup

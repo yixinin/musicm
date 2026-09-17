@@ -1402,18 +1402,25 @@ fn cmd_play(cfg: &Config, song_id: &str, force: bool) -> Result<()> {
 /// 只有「把树交给内核」那一步按平台分叉（见 `mount_now`）。
 fn cmd_mount(cfg: &Config, args: MountArgs) -> Result<()> {
     let index = Index::load(&cfg.index_path())?;
-    if index.stats().tracks == 0 {
-        return Err(anyhow!("索引里没有曲目，先执行: musicm scan <歌单id>"));
-    }
-    if !cfg.out_root.is_dir() {
-        return Err(anyhow!(
-            "音乐目录还不存在: {}。先执行一次 musicm play <曲目id>",
-            cfg.out_root.display()
-        ));
-    }
+    let indexed = index.stats().tracks;
 
     let vfs = vfs::Vfs::build(&cfg.out_root, &index, cfg.quality, args.ondemand);
     let tree = vfs.stats();
+
+    // 判据是「树里到底有没有东西」，不是「索引里有没有曲目」。
+    //
+    // 以前这里要求索引非空，理由是「你大概忘了 scan」。但 daily / search / play
+    // 这三条落地路径都**刻意不进索引**（见 fetch_many），所以一个只装了日推的库
+    // 是完全合法的挂载对象——cached 模式本来就是纯磁盘扫描。那个检查会把这种
+    // 用法一并拒掉，而拒绝的理由（"先 scan"）对用户来说是答非所问。
+    if tree.files == 0 && indexed == 0 {
+        return Err(anyhow!(
+            "没有可挂载的内容：{} 里没有任何文件，索引里也没有曲目。\n\
+             先执行 musicm scan <歌单id>，或者用 musicm daily --fetch N / \
+             musicm play <曲目id> 落地几个文件。",
+            cfg.out_root.display()
+        ));
+    }
 
     println!(
         "挂载 musicm（{}）",
@@ -1441,6 +1448,26 @@ fn cmd_mount(cfg: &Config, args: MountArgs) -> Result<()> {
         println!("  提醒     飞牛音乐整库扫描会逐个读元信息，等于把整张歌单下完。");
         println!("           想先扫完再听，用 --fuse-mode cached，或先 musicm play 预热。");
     }
+    if indexed == 0 {
+        println!(
+            "  提醒     索引里没有曲目：这次挂的是纯磁盘内容（{} 个文件）。",
+            tree.files
+        );
+        println!("           日推 / 搜索 / 单曲落地都属于这一类，它们本来就不进索引。");
+        if args.ondemand {
+            println!("           此刻没有可取回的曲目，ondemand 与 cached 效果相同。");
+        }
+    } else if tree.files == 0 {
+        println!(
+            "  提醒     cached 模式下现在什么都看不到：{} 个索引进来的曲目还都没落地。",
+            indexed
+        );
+        println!("           想按需取用就换 --fuse-mode ondemand，或先 musicm play 预热。");
+    }
+    println!(
+        "  更新     新落地的文件会在 {} 秒内自动出现，挂载期间不必重挂。",
+        mount::REFRESH_SECS
+    );
     if !args.allow_other {
         println!("  权限     仅当前用户可读，飞牛音乐以别的用户运行时扫不到，需要 --allow-other");
     }

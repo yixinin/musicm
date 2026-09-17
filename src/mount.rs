@@ -20,11 +20,69 @@
 //! 而不是用 `#[cfg]` 从 `main.rs` 里挖掉一块。
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
 use crate::config::Config;
 use crate::vfs;
+
+/// 挂载后重扫磁盘的最小间隔（秒）。
+///
+/// 放在这个「总是被编译的文件」里，是为了让 CLI 的提示语和 FUSE 的实际行为用同一个
+/// 数字——写成两处，改一处就会有一句骗人的提示（`fuse_fs` 里的常量指向它）。
+///
+/// 为什么需要重扫：树是挂载那一刻的快照，而「每日推荐」每天都产生新文件、
+/// 按需取回也在挂载之后落地。没有它，用户每天都要重新挂载一次。
+pub const REFRESH_SECS: u64 = 30;
+
+/// 「到期才重扫」的闸门。
+///
+/// 逻辑本身很小，放在这里的原因是**用它的人在 Windows 上根本不参与编译**
+/// （`fuse_fs` 只是 Linux 模块），留在那边就永远没有测试——这正是本文件存在的
+/// 理由，见文件头。
+///
+/// 记的是「尝试」时刻而不是「成功」时刻：索引临时读不出来时也要等满一个间隔，
+/// 否则每一次 `readdir` 都会去读一次磁盘。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct RefreshGate {
+    interval: Duration,
+    last: Mutex<Instant>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl RefreshGate {
+    pub fn new(interval: Duration) -> Self {
+        RefreshGate {
+            interval,
+            // 刚挂载时树是刚算出来的，没必要立刻再扫一遍
+            last: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// 到间隔了返回 true，并把此刻记为「已尝试」。间隔为 0 等于每次都放行。
+    pub fn due(&self) -> bool {
+        let Ok(mut last) = self.last.lock() else {
+            // 锁坏了就不重扫。这是一项优化，坏掉时最保守的行为是「当作没到点」：
+            // 拿不到锁还去读磁盘，只会让别的请求一起卡住。
+            return false;
+        };
+        if last.elapsed() < self.interval {
+            return false;
+        }
+        *last = Instant::now();
+        true
+    }
+
+    /// 只给测试用：把「上次尝试」拨回到 `by` 之前。
+    #[cfg(test)]
+    fn rewind(&self, by: Duration) {
+        if let Ok(mut last) = self.last.lock() {
+            *last = Instant::now().checked_sub(by).unwrap_or_else(Instant::now);
+        }
+    }
+}
 
 /// 挂载参数。平台之间只有 `threads` 的用处不同（FUSE 事件循环线程数），
 /// 但参数两边都要拼，所以集中放在这里。
@@ -57,6 +115,10 @@ pub fn mount_now(
         ondemand: args.ondemand,
         allow_other: args.allow_other,
         threads: args.threads,
+        // 重扫用：索引路径 + 档位，让挂载期间新落地的文件（尤其是每日推荐）
+        // 不用重新挂载就能出现。
+        index_path: cfg.index_path(),
+        quality: cfg.quality,
     };
 
     match fuse_fs::run(req) {
@@ -223,5 +285,23 @@ mod tests {
     fn mount_fields_are_escaped_like_the_kernel_does() {
         assert_eq!(escape_mount_field("/vol1/音乐"), "/vol1/音乐");
         assert_eq!(escape_mount_field("/vol1/my music"), "/vol1/my\\040music");
+    }
+
+    /// 间隔没到就不该放行：`readdir` 在一次目录扫描里会被调用成百上千次，
+    /// 每次都重扫磁盘就等于把音乐库目录walk 了成百上千遍。
+    #[test]
+    fn refresh_gate_stays_closed_within_the_interval() {
+        let gate = RefreshGate::new(Duration::from_secs(30));
+        assert!(!gate.due(), "刚挂载时不该到点");
+        assert!(!gate.due(), "连问两次都不该放行：第一次没动过时刻");
+    }
+
+    /// 放行过一次之后必须重新等满间隔——否则「到期」这个概念就没意义了。
+    #[test]
+    fn refresh_gate_consumes_its_turn() {
+        let gate = RefreshGate::new(Duration::from_secs(30));
+        gate.rewind(Duration::from_secs(60));
+        assert!(gate.due(), "拨回到 60 秒前应当放行");
+        assert!(!gate.due(), "放过一次之后要重新计时");
     }
 }

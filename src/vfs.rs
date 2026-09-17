@@ -13,7 +13,7 @@
 //! 同一个路径一旦换了 inode，正在播放的文件会突然读到别的东西。
 //! 所以这里不在变更时重建整棵树，只在原地更新节点。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -118,11 +118,27 @@ pub struct VfsStats {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct Counts {
+    files: usize,
+    /// 待取回节点的 inode 集合（重扫前后对比用）
+    pending: BTreeSet<u64>,
+}
+
 #[derive(Debug, Clone)]
 struct Plan {
     track: String,
     size: u64,
     mtime: u64,
+}
+
+/// 一次重扫的结果。只用于日志与测试断言，树本身的语义不依赖它。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefreshStats {
+    /// 新出现的文件节点（之前树里没有）
+    pub added: usize,
+    /// 从「待取回」**原位**变成「已落地」的，inode 不变
+    pub materialized: usize,
 }
 
 impl Vfs {
@@ -132,24 +148,90 @@ impl Vfs {
     /// 扫描最快，代价是没下载的曲目看不见。
     pub fn build(out_root: &Path, index: &Index, quality: Quality, include_pending: bool) -> Vfs {
         let mut vfs = Vfs::empty();
+        vfs.load(out_root, index, quality, include_pending);
+        vfs
+    }
+
+    /// 增量装载：索引期望的文件 ∪ 磁盘上已有的文件。
+    ///
+    /// **已有的节点一律复用**（`by_rel` 命中就直接返回原 inode），不做任何清理，
+    /// 所以 `build` 与 [`Vfs::refresh`] 共用这一条路径时 inode 语义是一致的。
+    fn load(&mut self, out_root: &Path, index: &Index, quality: Quality, include_pending: bool) {
         let planned = plan(index, quality);
 
         // 未落地的曲目先占位，文件名必须在下载之前就定下来——
         // 这正是 `expected_ext` 那个猜测存在的原因。
         if include_pending {
             for (rel, p) in &planned {
-                vfs.insert_chain(rel, Some(p.track.clone()), p.size, p.mtime, false);
+                self.insert_chain(rel, Some(p.track.clone()), p.size, p.mtime, false);
             }
         }
 
         // 再扫真实目录：已存在的文件会被标成 materialized 并覆盖成真实大小/时间。
         if out_root.is_dir() {
-            vfs.scan_dir(out_root, out_root, ROOT_INO, 0, &planned);
+            self.scan_dir(out_root, out_root, ROOT_INO, 0, &planned);
         }
 
         // 不在任何歌单里的曲目不走计划（无法参与同名去重），
         // 但只要落过盘就会在上面这一步被带出来，够用了。
-        vfs
+    }
+
+    /// 磁盘上又多出文件之后，在原树上增量重扫。
+    ///
+    /// 存在的理由很具体：「每日推荐」天天变，`daily --fetch` 落地的文件是在**挂载之后**
+    /// 才出现的，而树是挂载那一刻算出来的快照。没有这一步，用户每天都要重新挂载一次
+    /// 才看得到今天的日推。
+    ///
+    /// **为什么不重建整棵树**：内核拿 inode 做 dentry 缓存，重建会把已有路径的 inode
+    /// 全换掉，正在播放的文件会突然读到别的东西（见文件头那条约束）。所以这里只做
+    /// 「复用旧 inode、给新路径新分配」，绝不重新编号。
+    ///
+    /// **只增不删**，这一点也是刻意的：删除节点会和 [`Vfs::adopt`] 竞争。
+    /// 取回音频的流程是「按猜测的扩展名先占位 → 落地 → adopt 改名」，在改名完成之前
+    /// 猜测的那个路径在磁盘上确实不存在；一次重扫要是把「磁盘上找不到」当成删除，
+    /// 就会把正在取回的节点删掉。代价是手动删掉的文件会留在树里直到重新挂载——
+    /// 比误删要好得多。
+    ///
+    /// `index` 应当是**重新从磁盘读出来的**索引（而不是挂载时的快照），这样挂载期间
+    /// 新扫的歌单、新落地的曲目也能一并进来。
+    pub fn refresh(
+        &mut self,
+        out_root: &Path,
+        index: &Index,
+        quality: Quality,
+        include_pending: bool,
+    ) -> RefreshStats {
+        let before = self.snapshot_counts();
+        self.load(out_root, index, quality, include_pending);
+
+        // 「升级」要按**重扫前就是待取回**的那批节点来数。直接用「已落地节点数变多了多少」
+        // 会把新落盘的文件也算进去——那些文件本来就不是占位节点，两种事实混在一起，
+        // 日志就会撒谎（新落地 1 首却报「1 个转为已落地」，听起来像有曲目被取回了）。
+        let materialized = before
+            .pending
+            .iter()
+            .filter(|ino| self.nodes.get(ino).is_some_and(|n| n.materialized))
+            .count();
+        let after_files = self.snapshot_counts().files;
+
+        RefreshStats {
+            added: after_files.saturating_sub(before.files),
+            materialized,
+        }
+    }
+
+    fn snapshot_counts(&self) -> Counts {
+        let mut c = Counts::default();
+        for node in self.nodes.values() {
+            if node.kind != NodeKind::File {
+                continue;
+            }
+            c.files += 1;
+            if !node.materialized {
+                c.pending.insert(node.ino);
+            }
+        }
+        c
     }
 
     fn empty() -> Vfs {
@@ -619,6 +701,69 @@ mod tests {
         let pl = vfs.lookup(source, "热歌榜").unwrap().ino;
         assert!(vfs.lookup(pl, "01 已下载 - 歌手.mp3").is_some());
         assert!(vfs.lookup(pl, "02 没下载 - 歌手.mp3").is_none());
+        assert_eq!(vfs.stats().pending, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 挂载之后才落地的文件（`daily --fetch` 就是这个场景）必须能被重扫进来，
+    /// 而且**已有路径的 inode 一个都不能变**——内核的 dentry 缓存认这个。
+    #[test]
+    fn refresh_picks_up_new_files_without_renumbering() {
+        let root = temp_root("refresh");
+        let index = fixture(&root);
+        let mut vfs = Vfs::build(&root, &index, Quality::Exhigh, false);
+
+        let source = vfs.lookup(ROOT_INO, "网易云").unwrap().ino;
+        let pl = vfs.lookup(source, "热歌榜").unwrap().ino;
+        let before = vfs.lookup(pl, "01 已下载 - 歌手.mp3").unwrap().ino;
+
+        // 模拟日推落地：一个新目录 + 一个文件
+        let daily = root.join("网易云").join("每日推荐");
+        fs::create_dir_all(&daily).unwrap();
+        fs::write(daily.join("新歌 - 歌手.mp3"), vec![0u8; 10]).unwrap();
+
+        let stats = vfs.refresh(&root, &index, Quality::Exhigh, false);
+        assert_eq!(stats.added, 1, "只该多出那一个新文件");
+        assert_eq!(stats.materialized, 0);
+
+        assert_eq!(
+            vfs.lookup(pl, "01 已下载 - 歌手.mp3").unwrap().ino,
+            before,
+            "旧文件的 inode 必须原样保留"
+        );
+        // 日推目录不能被误判成歌单曲目，它就是一块普通磁盘内容
+        let daily_ino = vfs.lookup(source, "每日推荐").expect("日推目录").ino;
+        let node = vfs.lookup(daily_ino, "新歌 - 歌手.mp3").expect("新文件");
+        assert!(node.materialized);
+        assert!(node.track.is_none(), "不属于任何歌单就不该挂曲目 key");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 占位节点等到文件真的落地时，要原位升级而不是多出一个条目——
+    /// 否则 readdir 会同时报出「没下载」和「已下载」两个同名文件。
+    #[test]
+    fn refresh_upgrades_pending_in_place() {
+        let root = temp_root("refresh_mat");
+        let index = fixture(&root);
+        let mut vfs = Vfs::build(&root, &index, Quality::Exhigh, true);
+
+        let source = vfs.lookup(ROOT_INO, "网易云").unwrap().ino;
+        let pl = vfs.lookup(source, "热歌榜").unwrap().ino;
+        let ino = vfs.lookup(pl, "02 没下载 - 歌手.mp3").unwrap().ino;
+        assert!(!vfs.get(ino).unwrap().materialized);
+
+        let dir = root.join("网易云").join("热歌榜");
+        fs::write(dir.join("02 没下载 - 歌手.mp3"), vec![0u8; 999]).unwrap();
+
+        let stats = vfs.refresh(&root, &index, Quality::Exhigh, true);
+        assert_eq!(stats.materialized, 1);
+        assert_eq!(stats.added, 0, "升级不该新增条目");
+
+        let node = vfs.lookup(pl, "02 没下载 - 歌手.mp3").unwrap();
+        assert_eq!(node.ino, ino, "inode 必须保持不变");
+        assert!(node.materialized);
+        assert_eq!(node.size, 999, "要换成磁盘上的真实大小");
+        assert_eq!(vfs.children(pl).len(), 3, "条目数不该变: {:?}", vfs.children(pl));
         assert_eq!(vfs.stats().pending, 0);
         let _ = fs::remove_dir_all(&root);
     }
